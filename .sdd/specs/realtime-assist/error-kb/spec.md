@@ -35,8 +35,13 @@ CREATE TABLE error_kb (
   resolved_by TEXT,                -- tool name used to resolve
   tool_sequence TEXT,              -- JSON array of tool names
   use_count INTEGER DEFAULT 0,    -- KB lookup count
-  last_used TEXT,                  -- last lookup timestamp
-  embedding BLOB                  -- sqlite-vec float[384] vector
+  last_used TEXT                   -- last lookup timestamp
+);
+
+-- Vector search virtual table (sqlite-vec)
+CREATE VIRTUAL TABLE vec_error_kb USING vec0(
+  error_kb_id INTEGER PRIMARY KEY,  -- references error_kb.id
+  embedding float[384]
 );
 ```
 
@@ -79,13 +84,14 @@ CREATE TABLE error_kb (
 시스템은 에러 메시지로 KB를 검색하여 과거 해결 이력을 반환해야 한다(SHALL).
 
 3단계 검색 전략 (우선순위 순서):
-1. **벡터 유사도 검색 (primary)**: 쿼리 에러의 임베딩을 생성하고, `vec_distance_cosine(embedding, ?) < 0.76` 조건으로 의미적으로 유사한 엔트리를 검색한다 (SHALL). 임베딩이 있는 엔트리 중 가장 유사한 항목을 반환한다.
+1. **벡터 유사도 검색 (primary)**: 쿼리 에러의 임베딩을 생성하고, `vec_error_kb` 가상 테이블에서 cosine distance < 0.76 조건으로 의미적으로 유사한 엔트리를 검색한다 (SHALL). `error_kb` 테이블과 JOIN하여 해결 이력이 있는 항목을 반환한다.
    ```sql
-   SELECT *, vec_distance_cosine(embedding, ?) AS distance
-   FROM error_kb
-   WHERE embedding IS NOT NULL AND resolution IS NOT NULL
-   ORDER BY distance ASC
-   LIMIT 1
+   SELECT e.*, v.distance
+   FROM vec_error_kb v
+   INNER JOIN error_kb e ON e.id = v.error_kb_id
+   WHERE v.embedding MATCH ? AND k = 1
+     AND e.resolution IS NOT NULL
+   ORDER BY v.distance
    ```
 2. **정확 텍스트 매치 (fallback 1)**: 벡터 검색 실패 시, 정규화된 에러와 `error_normalized` 필드가 완전히 일치하는 항목을 검색한다 (SHALL).
    ```sql

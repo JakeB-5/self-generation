@@ -208,18 +208,18 @@ constitution_version: "2.0.0"
 
 ## Requirement: REQ-DC-009 — 벡터 유사도 검색 (vectorSearch)
 
-시스템은 임베딩 벡터를 사용하여 `sqlite-vec`를 통한 유사도 검색을 수행(SHALL)할 수 있어야 한다.
+시스템은 임베딩 벡터를 사용하여 `sqlite-vec`의 vec0 가상 테이블을 통한 유사도 검색을 수행(SHALL)할 수 있어야 한다. 쿼리 임베딩은 `Buffer.from(new Float32Array(...).buffer)`로 변환하여 바인딩한다(SHALL).
 
 ### Scenario: 유사 이벤트 검색
 
-- **GIVEN** 검색 대상 테이블에 임베딩이 저장된 상태
-- **WHEN** `vectorSearch(table, embeddingColumn, queryEmbedding, limit)`를 호출하면
-- **THEN** `sqlite-vec`의 벡터 유사도 함수를 사용하여 가장 유사한 `limit`개의 결과를 반환(SHALL)한다
+- **GIVEN** vec0 가상 테이블에 임베딩이 저장된 상태
+- **WHEN** `vectorSearch(table, vecTable, queryEmbedding, limit)`를 호출하면
+- **THEN** vec0 가상 테이블에서 `MATCH` 연산자로 KNN 검색 후, 원본 테이블과 JOIN하여 가장 유사한 `limit`개의 결과를 반환(SHALL)한다
 
 ### Scenario: 결과 없음
 
-- **GIVEN** 검색 대상 테이블이 비어있는 상태
-- **WHEN** `vectorSearch(table, embeddingColumn, queryEmbedding, limit)`를 호출하면
+- **GIVEN** vec0 가상 테이블이 비어있는 상태
+- **WHEN** `vectorSearch(table, vecTable, queryEmbedding, limit)`를 호출하면
 - **THEN** 빈 배열 `[]`을 반환(SHALL)한다
 
 ---

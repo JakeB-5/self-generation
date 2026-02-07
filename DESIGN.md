@@ -403,8 +403,7 @@ export function initDb(db) {
       resolved_by TEXT,
       tool_sequence TEXT,
       use_count INTEGER DEFAULT 0,
-      last_used TEXT,
-      embedding BLOB
+      last_used TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_error_kb_error ON error_kb(error_normalized);
 
@@ -434,8 +433,17 @@ export function initDb(db) {
       source_path TEXT NOT NULL,
       description TEXT,
       keywords TEXT,
-      updated_at TEXT NOT NULL,
-      embedding BLOB
+      updated_at TEXT NOT NULL
+    );
+
+    -- Vector search virtual tables (sqlite-vec)
+    CREATE VIRTUAL TABLE IF NOT EXISTS vec_error_kb USING vec0(
+      error_kb_id INTEGER PRIMARY KEY,
+      embedding float[384]
+    );
+    CREATE VIRTUAL TABLE IF NOT EXISTS vec_skill_embeddings USING vec0(
+      skill_name TEXT PRIMARY KEY,
+      embedding float[384]
     );
   `);
 }
@@ -535,19 +543,30 @@ export async function generateEmbeddings(texts) {
 
 /**
  * 벡터 유사도 검색
- * sqlite-vec의 vec_distance_cosine으로 코사인 거리 기반 검색
+ * sqlite-vec의 vec0 가상 테이블에서 KNN 검색 후 원본 테이블과 JOIN
  */
-export function vectorSearch(table, embeddingColumn, queryEmbedding, limit = 5) {
+export function vectorSearch(table, vecTable, queryEmbedding, limit = 5) {
   const db = getDb();
-  const embeddingBlob = new Float32Array(queryEmbedding);
+  const embeddingBlob = Buffer.from(new Float32Array(queryEmbedding).buffer);
 
-  return db.prepare(`
-    SELECT *, vec_distance_cosine(${embeddingColumn}, ?) AS distance
-    FROM ${table}
-    WHERE ${embeddingColumn} IS NOT NULL
-    ORDER BY distance ASC
-    LIMIT ?
-  `).all(embeddingBlob, limit);
+  if (table === 'error_kb') {
+    return db.prepare(`
+      SELECT e.*, v.distance
+      FROM vec_error_kb v
+      INNER JOIN error_kb e ON e.id = v.error_kb_id
+      WHERE v.embedding MATCH ? AND k = ?
+      ORDER BY v.distance
+    `).all(embeddingBlob, limit);
+  } else if (table === 'skill_embeddings') {
+    return db.prepare(`
+      SELECT s.*, v.distance
+      FROM vec_skill_embeddings v
+      INNER JOIN skill_embeddings s ON s.name = v.skill_name
+      WHERE v.embedding MATCH ? AND k = ?
+      ORDER BY v.distance
+    `).all(embeddingBlob, limit);
+  }
+  return [];
 }
 
 /**
@@ -574,10 +593,23 @@ export function loadConfig() {
 }
 
 /**
+ * 설정 기반 시스템 활성화 체크
+ * 각 훅에서 호출하여 enabled=false이면 즉시 종료
+ */
+export function isEnabled() {
+  const config = loadConfig();
+  return config.enabled !== false;
+}
+
+/**
  * 오래된 이벤트 삭제 (replaces rotateIfNeeded + pruneOldLogs)
  * SQLite DELETE WHERE로 보관기간 초과 데이터 정리
  */
-export function pruneOldEvents(retentionDays = RETENTION_DAYS) {
+export function pruneOldEvents(retentionDays) {
+  if (retentionDays === undefined) {
+    const config = loadConfig();
+    retentionDays = config.retentionDays || RETENTION_DAYS;
+  }
   const db = getDb();
   const cutoff = new Date(Date.now() - retentionDays * 86400000).toISOString();
   db.prepare('DELETE FROM events WHERE ts < ?').run(cutoff);
@@ -784,6 +816,8 @@ function normalizeError(error) {
     .trim();
 }
 ```
+
+> **주의**: 위 Phase 1 `error-logger.mjs`는 8.3절의 v6 확장 버전으로 **완전 교체**된다. Phase 1과 v6를 병합하지 말 것 — v6 버전이 최종본이다.
 
 ### 4.6 세션 요약 훅 (SessionEnd)
 
@@ -995,7 +1029,7 @@ const PROMPT_TEMPLATE = join(GLOBAL_DIR, 'prompts', 'analyze.md');
  * SessionEnd 훅 또는 CLI에서 호출
  */
 export function runAnalysis(options = {}) {
-  const { days = 7, project = null } = options;
+  const { days = 7, project = null, projectPath = null } = options;
 
   const since = new Date(Date.now() - days * 86400000).toISOString();
   const filter = { since };
@@ -1011,16 +1045,17 @@ export function runAnalysis(options = {}) {
 
   // 로그 데이터를 요약하여 프롬프트에 주입 (토큰 절약)
   const logSummary = summarizeForPrompt(entries);
-  const prompt = buildPrompt(logSummary, days, project);
+  const prompt = buildPrompt(logSummary, days, project, projectPath);
 
   try {
     // claude --print: 비대화형 모드로 실행, JSON 응답만 받음
     const result = execSync(
-      'claude --print',
+      'claude --print --model sonnet',
       {
         input: prompt,
         encoding: 'utf-8',
-        maxBuffer: 10 * 1024 * 1024
+        maxBuffer: 10 * 1024 * 1024,
+        timeout: 120000  // 2 minutes max
       }
     );
 
@@ -1045,12 +1080,12 @@ export function runAnalysis(options = {}) {
  * SessionEnd 훅에서 호출
  */
 export function runAnalysisAsync(options = {}) {
-  const args = ['--print'];
-  const { days = 7, project = null } = options;
+  const { days = 7, project = null, projectPath = null } = options;
 
   const child = spawn('node', [join(GLOBAL_DIR, 'bin', 'analyze.mjs'),
     '--days', String(days),
-    ...(project ? ['--project', project] : [])
+    ...(project ? ['--project', project] : []),
+    ...(projectPath ? ['--project-path', projectPath] : [])
   ], {
     detached: true,
     stdio: 'ignore'
@@ -1113,7 +1148,7 @@ function summarizeForPrompt(entries, maxPrompts = 100) {
   };
 }
 
-function buildPrompt(logSummary, days, project) {
+function buildPrompt(logSummary, days, project, projectPath = null) {
   let template = readFileSync(PROMPT_TEMPLATE, 'utf-8');
   template = template.replace('{{days}}', String(days));
   template = template.replace('{{project}}', project || 'all');
@@ -1125,11 +1160,11 @@ function buildPrompt(logSummary, days, project) {
     feedback ? JSON.stringify(feedback, null, 2) : '피드백 이력 없음 (첫 분석)');
 
   // P3: 기존 스킬 목록 주입 (v7)
-  // project name → projectPath 조회 (이벤트에서 가장 최근 경로 사용)
-  const projectPath = project
+  // projectPath 직접 전달 우선, 없으면 이벤트에서 가장 최근 경로 조회
+  const resolvedPath = projectPath || (project
     ? queryEvents({ project, limit: 1 })[0]?.projectPath || null
-    : null;
-  const skills = loadSkills(projectPath);
+    : null);
+  const skills = loadSkills(resolvedPath);
   template = template.replace('{{existing_skills}}',
     skills.length > 0 ? skills.map(s => `- ${s.name}: ${s.description || ''}`).join('\n') : '등록된 스킬 없음');
 
@@ -1216,27 +1251,34 @@ try {
   // AI 분석을 백그라운드로 트리거 (세션 종료를 블로킹하지 않음)
   // P8: reason='clear'이거나 프롬프트 3개 미만이면 분석 생략 (v7)
   if (!skipAnalysis && prompts.length >= 3) {
-    runAnalysisAsync({ days: 7, project: getProjectName(input.cwd) });
+    runAnalysisAsync({ days: 7, project: getProjectName(input.cwd), projectPath: input.cwd });
   }
 
   // v8: 임베딩 미생성 에러 KB 엔트리에 대한 배치 임베딩 트리거
   try {
+    // Ensure embedding daemon is running (may have timed out during long sessions)
+    const { isServerRunning, startServer } = await import('../lib/embedding-client.mjs');
+    if (!await isServerRunning()) {
+      await startServer();
+      await new Promise(r => setTimeout(r, 5000)); // Wait for model load
+    }
+
     const db = getDb();
     const newErrors = db.prepare(`
-      SELECT id, error_normalized FROM error_kb WHERE embedding IS NULL
+      SELECT id, error_normalized FROM error_kb
+      WHERE id NOT IN (SELECT error_kb_id FROM vec_error_kb)
     `).all();
     if (newErrors.length > 0) {
-      // Synchronous embedding generation (already in SessionEnd hook)
       const { generateEmbeddings } = await import('../lib/db.mjs');
       const texts = newErrors.map(e => e.error_normalized);
       const embeddings = await generateEmbeddings(texts);
 
       // Update embeddings in error_kb table
-      const stmt = db.prepare('UPDATE error_kb SET embedding = ? WHERE id = ?');
+      const vecStmt = db.prepare('INSERT OR REPLACE INTO vec_error_kb (error_kb_id, embedding) VALUES (?, ?)');
       newErrors.forEach((err, i) => {
         if (embeddings[i]) {
-          const embeddingBlob = new Float32Array(embeddings[i]);
-          stmt.run(embeddingBlob, err.id);
+          const embeddingBlob = Buffer.from(new Float32Array(embeddings[i]).buffer);
+          vecStmt.run(err.id, embeddingBlob);
         }
       });
     }
@@ -1486,8 +1528,9 @@ switch (suggestion.type) {
         const settingsPath = join(process.env.HOME, '.claude', 'settings.json');
         const settings = existsSync(settingsPath) ? JSON.parse(readFileSync(settingsPath, 'utf-8')) : {};
         const event = suggestion.hookEvent || 'PostToolUse';
-        if (!settings[event]) settings[event] = [];
-        settings[event].push(settingsEntry);
+        if (!settings.hooks) settings.hooks = {};
+        if (!settings.hooks[event]) settings.hooks[event] = [];
+        settings.hooks[event].push(settingsEntry);
         writeFileSync(settingsPath, JSON.stringify(settings, null, 2));
         console.log(`✅ settings.json에 등록 완료`);
       } else {
@@ -1676,7 +1719,7 @@ function calcSkillUsageRate() {
       `SELECT COUNT(*) AS cnt FROM events WHERE type = 'skill_used'`
     ).get().cnt;
     const skillCreated = db.prepare(
-      `SELECT COUNT(*) AS cnt FROM events WHERE type = 'prompt' AND json_extract(data, '$.intent') = 'skill_created'`
+      `SELECT COUNT(*) AS cnt FROM events WHERE type = 'skill_created'`
     ).get().cnt;
     return skillCreated > 0 ? skillUsed / skillCreated : null;
   } catch { return null; }
@@ -1853,7 +1896,7 @@ export async function searchErrorKB(normalizedError) {
     // Generate embedding from normalized error text first
     const embeddings = await generateEmbeddings([normalizedError]);
     if (embeddings && embeddings[0]) {
-      const vectorResults = vectorSearch('error_kb', 'embedding', embeddings[0], 3);
+      const vectorResults = vectorSearch('error_kb', 'vec_error_kb', embeddings[0], 3);
       if (vectorResults.length > 0 && vectorResults[0].distance < 0.76) {
         // 사용 카운트 증가
         db.prepare('UPDATE error_kb SET use_count = use_count + 1, last_used = ? WHERE id = ?')
@@ -1945,10 +1988,19 @@ try {
     const output = {
       hookSpecificOutput: {
         hookEventName: 'PostToolUseFailure',
-        additionalContext: `[Self-Generation 에러 KB] 이전에 동일 에러를 해결한 이력이 있습니다:\n` +
-          `- 에러: ${kbMatch.error_normalized}\n` +
-          `- 해결 방법: ${kbMatch.resolution}\n` +
-          `이 정보를 참고하여 해결을 시도하세요.`
+        additionalContext: (() => {
+          let resText = kbMatch.resolution;
+          try {
+            const res = JSON.parse(kbMatch.resolution);
+            resText = res.toolSequence
+              ? `${res.resolvedBy}: ${res.toolSequence.join(' → ')}`
+              : res.resolvedBy || kbMatch.resolution;
+          } catch {}
+          return `[Self-Generation 에러 KB] 이전에 동일 에러를 해결한 이력이 있습니다:\n` +
+            `- 에러: ${kbMatch.error_normalized}\n` +
+            `- 해결 방법: ${resText}\n` +
+            `이 정보를 참고하여 해결을 시도하세요.`;
+        })()
       }
     };
     process.stdout.write(JSON.stringify(output));
@@ -2013,23 +2065,34 @@ if (existsSync(SOCKET_PATH)) unlinkSync(SOCKET_PATH);
 const server = createServer((conn) => {
   resetIdleTimer();
   let data = '';
-  conn.on('data', chunk => { data += chunk; });
-  conn.on('end', async () => {
-    try {
-      const req = JSON.parse(data);
-      if (req.action === 'health') {
-        conn.end(JSON.stringify({ status: 'ok' }));
-      } else if (req.action === 'embed' && req.texts) {
-        const embeddings = await embed(req.texts);
-        conn.end(JSON.stringify({ embeddings }));
-      } else {
-        conn.end(JSON.stringify({ error: 'unknown action' }));
-      }
-    } catch (e) {
-      conn.end(JSON.stringify({ error: e.message }));
+  conn.on('data', chunk => {
+    data += chunk;
+    // Process when we receive a complete JSON line (newline-delimited)
+    const newlineIdx = data.indexOf('\n');
+    if (newlineIdx !== -1) {
+      const message = data.slice(0, newlineIdx);
+      data = data.slice(newlineIdx + 1);
+      handleRequest(conn, message);
     }
   });
+  conn.on('error', () => {}); // Ignore client disconnect errors
 });
+
+async function handleRequest(conn, message) {
+  try {
+    const req = JSON.parse(message);
+    if (req.action === 'health') {
+      conn.end(JSON.stringify({ status: 'ok' }) + '\n');
+    } else if (req.action === 'embed' && req.texts) {
+      const embeddings = await embed(req.texts);
+      conn.end(JSON.stringify({ embeddings }) + '\n');
+    } else {
+      conn.end(JSON.stringify({ error: 'unknown action' }) + '\n');
+    }
+  } catch (e) {
+    try { conn.end(JSON.stringify({ error: e.message }) + '\n'); } catch {}
+  }
+}
 
 // Initialize model, then start listening
 await init();
@@ -2045,14 +2108,14 @@ process.on('SIGINT', () => { server.close(); process.exit(0); });
 
 ### 8.1.2 임베딩 클라이언트 (embedding-client.mjs)
 
-훅 프로세스에서 임베딩 데몬과 통신하는 경량 클라이언트. 2초 타임아웃 내 응답을 보장한다.
+훅 프로세스에서 임베딩 데몬과 통신하는 경량 클라이언트. 10초 타임아웃 내 응답을 보장한다 (콜드 스타트 시 모델 로딩 대기 포함).
 
 ```javascript
 // ~/.self-generation/lib/embedding-client.mjs
 import { createConnection } from 'net';
 
 const SOCKET_PATH = '/tmp/self-gen-embed.sock';
-const TIMEOUT_MS = 2000;
+const TIMEOUT_MS = 10000;
 
 /**
  * 임베딩 데몬에 벡터 생성 요청
@@ -2082,8 +2145,7 @@ export function embedViaServer(texts) {
       reject(e);
     });
 
-    conn.write(JSON.stringify({ action: 'embed', texts }));
-    conn.end();
+    conn.write(JSON.stringify({ action: 'embed', texts }) + '\n');
   });
 }
 
@@ -2105,8 +2167,7 @@ export function isServerRunning() {
           resolve(JSON.parse(data).status === 'ok');
         } catch { resolve(false); }
       });
-      conn.write(JSON.stringify({ action: 'health' }));
-      conn.end();
+      conn.write(JSON.stringify({ action: 'health' }) + '\n');
     });
   });
 }
@@ -2188,7 +2249,7 @@ export async function matchSkill(prompt, skills) {
   try {
     const embeddings = await generateEmbeddings([prompt]);
     if (embeddings && embeddings[0]) {
-      const results = vectorSearch('skill_embeddings', 'embedding', embeddings[0], 1);
+      const results = vectorSearch('skill_embeddings', 'vec_skill_embeddings', embeddings[0], 1);
       if (results.length > 0 && results[0].distance < 0.76) {
         return {
           name: results[0].name,
@@ -2362,7 +2423,7 @@ try {
   }
 
   // 2. 이전 세션 컨텍스트 주입 (v6 추가, SQL 인덱스 기반 조회)
-  const recentSummaries = queryEvents({ type: 'session_summary', project, limit: 1 })
+  const recentSummaries = queryEvents({ type: 'session_summary', projectPath: input.cwd, limit: 1 })
     .slice(-1); // 가장 최근 세션 요약 1개
 
   if (recentSummaries.length > 0) {
@@ -2448,7 +2509,11 @@ try {
       const kbResult = await searchErrorKB(errorData.error);
       if (kbResult) {
         parts.push(`⚠️ 이 파일 관련 과거 에러 이력: ${kbResult.error_normalized}`);
-        parts.push(`   해결 방법: ${kbResult.resolution}`);
+        try {
+          const res = JSON.parse(kbResult.resolution);
+          parts.push(`   해결 방법: ${res.resolvedBy || ''} (${res.tool || ''})`);
+          if (res.toolSequence) parts.push(`   해결 경로: ${res.toolSequence.join(' → ')}`);
+        } catch { parts.push(`   해결 방법: ${kbResult.resolution}`); }
       }
     }
   }
@@ -2473,22 +2538,22 @@ try {
     }
   }
 
-  // 3. Task 도구: 서브에이전트 성능 데이터 안내
+  // 3. Task 도구: 서브에이전트 사용 빈도 안내
   if (input.tool_name === 'Task' && input.tool_input?.subagent_type) {
     const agentType = input.tool_input.subagent_type;
     const db = getDb();
-    const agentStats = db.prepare(`
-      SELECT data FROM events
+    const usageCount = db.prepare(`
+      SELECT COUNT(*) AS cnt FROM events
       WHERE type = 'subagent_stop' AND json_extract(data, '$.agentType') = ?
-      ORDER BY ts DESC LIMIT 20
-    `).all(agentType);
-    const failures = agentStats.filter(s => {
-      const d = JSON.parse(s.data);
-      return !d.success;
-    });
-    if (agentStats.length >= 5 && failures.length / agentStats.length > 0.3) {
-      parts.push(`📊 ${agentType} 최근 실패율: ${Math.round(failures.length / agentStats.length * 100)}% (${agentStats.length}회 중 ${failures.length}회)`);
-      parts.push(`   더 높은 티어의 에이전트 사용을 고려하세요.`);
+    `).get(agentType)?.cnt || 0;
+
+    if (usageCount >= 5) {
+      const avgHist = db.prepare(`
+        SELECT json_extract(data, '$.agentType') AS agent, COUNT(*) AS cnt
+        FROM events WHERE type = 'subagent_stop'
+        GROUP BY agent ORDER BY cnt DESC LIMIT 5
+      `).all();
+      parts.push(`📊 ${agentType} 사용 ${usageCount}회. 최다 사용 에이전트: ${avgHist.map(h => `${h.agent}(${h.cnt})`).join(', ')}`);
     }
   }
 
@@ -2529,7 +2594,7 @@ try {
   const project = getProjectName(input.cwd);
 
   // 1. 프로젝트별 최근 에러 패턴 주입 (SQL 인덱스 기반 조회)
-  const projectErrors = queryEvents({ type: 'tool_error', project, limit: 3 });
+  const projectErrors = queryEvents({ type: 'tool_error', projectPath: input.cwd, limit: 3 });
 
   if (projectErrors.length > 0) {
     parts.push('이 프로젝트의 최근 에러 패턴:');
@@ -2576,6 +2641,7 @@ try {
   "hooks": {
     "PreToolUse": [
       {
+        "matcher": "Edit|Write|Bash|Task",
         "hooks": [
           {
             "type": "command",
@@ -2692,14 +2758,19 @@ CREATE TABLE IF NOT EXISTS error_kb (
   resolved_by TEXT,                  -- 해결 방식: 'success_after_error', 'cross_tool_resolution'
   tool_sequence TEXT,                -- 해결 도구 시퀀스 (JSON array)
   use_count INTEGER DEFAULT 0,      -- KB 검색으로 활용된 횟수
-  last_used TEXT,                    -- 마지막 활용 시각
-  embedding BLOB                    -- sqlite-vec float[384] 벡터 (배치 생성)
+  last_used TEXT                     -- 마지막 활용 시각
 );
 CREATE INDEX IF NOT EXISTS idx_error_kb_error ON error_kb(error_normalized);
+
+-- Vector search virtual table (sqlite-vec)
+CREATE VIRTUAL TABLE IF NOT EXISTS vec_error_kb USING vec0(
+  error_kb_id INTEGER PRIMARY KEY,
+  embedding float[384]
+);
 ```
 
-> **임베딩 전략**: `embedding` 컬럼은 INSERT 시 NULL로 저장되고,
-> SessionEnd 배치에서 임베딩 데몬을 통해 비동기 생성된다.
+> **임베딩 전략**: `error_kb` 테이블 INSERT 시 임베딩은 생성하지 않고,
+> SessionEnd 배치에서 임베딩 데몬을 통해 `vec_error_kb` 가상 테이블에 비동기 생성된다.
 > 실시간 훅의 벡터 검색도 임베딩 데몬(Unix socket)을 통해 ~5ms로 처리된다.
 > 데몬 미실행 시 텍스트 매칭(정확+접두사)으로 폴백한다.
 > 임계값: distance < 0.76 (고신뢰), 0.76~0.85 (저신뢰+키워드 검증), >= 0.85 (매칭 없음)
@@ -2744,8 +2815,13 @@ CREATE TABLE IF NOT EXISTS skill_embeddings (
   source_path TEXT NOT NULL,        -- 스킬 파일 경로
   description TEXT,                 -- 스킬 설명
   keywords TEXT,                    -- 추출된 키워드 (JSON array)
-  updated_at TEXT NOT NULL,
-  embedding BLOB                    -- sqlite-vec float[384] 벡터
+  updated_at TEXT NOT NULL
+);
+
+-- Vector search virtual table (sqlite-vec)
+CREATE VIRTUAL TABLE IF NOT EXISTS vec_skill_embeddings USING vec0(
+  skill_name TEXT PRIMARY KEY,
+  embedding float[384]
 );
 ```
 
@@ -2774,7 +2850,7 @@ CREATE TABLE IF NOT EXISTS skill_embeddings (
     "server": {
       "socketPath": "/tmp/self-gen-embed.sock",
       "idleTimeoutMinutes": 30,
-      "clientTimeoutMs": 2000
+      "clientTimeoutMs": 10000
     }
   }
 }

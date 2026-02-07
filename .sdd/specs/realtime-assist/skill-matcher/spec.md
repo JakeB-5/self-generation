@@ -31,8 +31,13 @@ CREATE TABLE skill_embeddings (
   source_path TEXT NOT NULL,       -- full path to skill file
   description TEXT,                -- extracted description from skill file
   keywords TEXT,                   -- JSON array of extracted keywords
-  updated_at TEXT NOT NULL,        -- ISO 8601 timestamp
-  embedding BLOB                   -- sqlite-vec float[384] vector
+  updated_at TEXT NOT NULL         -- ISO 8601 timestamp
+);
+
+-- Vector search virtual table (sqlite-vec)
+CREATE VIRTUAL TABLE vec_skill_embeddings USING vec0(
+  skill_name TEXT PRIMARY KEY,     -- references skill_embeddings.name
+  embedding float[384]
 );
 ```
 
@@ -80,14 +85,13 @@ CREATE TABLE skill_embeddings (
 시스템은 사용자 프롬프트와 스킬 목록을 비교하여 가장 관련 있는 스킬을 반환해야 한다(SHALL).
 
 2단계 매칭 전략 (우선순위 순서):
-1. **벡터 유사도 검색 (primary)**: 프롬프트의 임베딩을 생성하고, `skill_embeddings` 테이블에서 cosine distance가 0.76 미만인 가장 유사한 스킬을 반환한다(SHALL).
+1. **벡터 유사도 검색 (primary)**: 프롬프트의 임베딩을 생성하고, `vec_skill_embeddings` 가상 테이블에서 cosine distance가 0.76 미만인 가장 유사한 스킬을 반환한다(SHALL). `skill_embeddings` 테이블과 JOIN한다.
    ```sql
-   SELECT name, source_path, description,
-          vec_distance_cosine(embedding, ?) AS distance
-   FROM skill_embeddings
-   WHERE embedding IS NOT NULL
-   ORDER BY distance ASC
-   LIMIT 1
+   SELECT s.name, s.source_path, s.description, v.distance
+   FROM vec_skill_embeddings v
+   INNER JOIN skill_embeddings s ON s.name = v.skill_name
+   WHERE v.embedding MATCH ? AND k = 1
+   ORDER BY v.distance
    ```
    - distance < 0.76이면 `{ skill, confidence: 1.0 - distance }` 반환 (SHALL)
 2. **키워드 패턴 매칭 (fallback)**: 벡터 검색 실패 또는 임베딩 미존재 시, 스킬 파일의 "감지된 패턴" 섹션에서 추출한 패턴 키워드 중 50% 이상이 프롬프트에 포함되면 해당 스킬을 반환한다(SHALL).
@@ -124,11 +128,12 @@ CREATE TABLE skill_embeddings (
 
 시스템은 변경된 스킬 파일의 임베딩을 재생성해야 한다(SHALL).
 
-1. `skill_embeddings` 테이블에서 `embedding IS NULL`이거나 `updated_at`이 소스 파일의 mtime보다 오래된 엔트리를 조회한다(SHALL)
+1. `skill_embeddings` 테이블에서 `vec_skill_embeddings`에 임베딩이 없거나 `updated_at`이 소스 파일의 mtime보다 오래된 엔트리를 조회한다(SHALL)
 2. 해당 스킬의 description + keywords 텍스트로 `await generateEmbeddings()`를 호출하여 벡터를 생성한다(SHALL) — Transformers.js 비동기 처리
-3. 생성된 벡터를 `embedding` 컬럼에 업데이트한다(SHALL)
+3. 생성된 벡터를 `vec_skill_embeddings` 가상 테이블에 저장하고 `updated_at`을 갱신한다(SHALL)
    ```sql
-   UPDATE skill_embeddings SET embedding = ?, updated_at = ? WHERE name = ?
+   INSERT OR REPLACE INTO vec_skill_embeddings (skill_name, embedding) VALUES (?, ?);
+   UPDATE skill_embeddings SET updated_at = ? WHERE name = ?;
    ```
 4. 임베딩 생성 실패 시 해당 스킬을 건너뛰고 다음 스킬을 계속 처리해야 한다(SHALL)
 5. SessionEnd 또는 SessionStart 시점에 호출되어야 한다(SHOULD)
