@@ -155,6 +155,7 @@ Claude Code를 사용하면서 사용자는 무의식적으로 동일한 패턴�
 │  │                                                           │   │
 │  │  Session Start ──→ [SessionStart] ──→ DB 캐시 주입        │   │
 │  │                                  ──→ 이전 세션 컨텍스트    │   │
+│  │                                  ──→ 임베딩 데몬 시작     │   │
 │  │                                                           │   │
 │  └───────────────────────────────────────────────────────────┘   │
 │                                                                  │
@@ -182,6 +183,7 @@ Claude Code를 사용하면서 사용자는 무의식적으로 동일한 패턴�
 | Analysis Cache | AI 분석 결과 저장, SessionStart에서 주입 | `analysis_cache` 테이블 (SQLite) |
 | Error KB | 에러 해결 이력 저장 + 벡터 유사도 검색 | `error_kb` 테이블 (SQLite + sqlite-vec) |
 | Skill Matcher | 기존 스킬과 프롬프트 벡터 매칭 | `skill_embeddings` 테이블 + UserPromptSubmit 훅 |
+| Embedding Daemon | Transformers.js 모델 상주 프로세스, Unix socket 서버 | SessionStart에서 자동 시작, 비활성 30분 후 자동 종료 |
 | Subagent Tracker | 서브에이전트 성능 메트릭 추적 | SubagentStop 훅 |
 | Feedback Tracker | 제안 채택/거부 추적 | `feedback` 테이블 (SQLite) |
 
@@ -215,6 +217,8 @@ Claude Code를 사용하면서 사용자는 무의식적으로 동일한 패턴�
 │   ├── ai-analyzer.mjs            ← claude --print 기반 AI 분석 실행
 │   ├── error-kb.mjs               ← 에러 KB 벡터 검색/기록
 │   ├── skill-matcher.mjs          ← 벡터 기반 스킬-프롬프트 매칭
+│   ├── embedding-server.mjs       ← 임베딩 데몬 (Transformers.js 상주 프로세스)
+│   ├── embedding-client.mjs       ← 임베딩 클라이언트 (훅용 소켓 통신)
 │   └── feedback-tracker.mjs       ← 피드백 추적
 ├── prompts/
 │   └── analyze.md                 ← AI 분석 프롬프트 템플릿
@@ -307,7 +311,7 @@ Claude Code를 사용하면서 사용자는 무의식적으로 동일한 패턴�
 ```
 
 **설계 원칙:**
-- 모든 수집 훅은 **non-blocking** (exit code 0, 빠른 완료)
+- 모든 수집 훅은 **non-blocking** (exit code 0, 빠른 완료, 임베딩은 데몬 소켓 통신으로 ~5ms)
 - 훅 실패가 Claude Code 세션에 영향을 주지 않음
 
 #### API 필드 검증 결과
@@ -336,7 +340,7 @@ Claude Code 공식 문서 대조를 통해 설계에 사용된 모든 API 필드
 // ~/.self-generation/lib/db.mjs
 import Database from 'better-sqlite3';
 import * as sqliteVec from 'sqlite-vec';
-import { mkdirSync, existsSync, openSync, readSync, closeSync } from 'fs';
+import { mkdirSync, existsSync } from 'fs';
 import { readFileSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
@@ -514,37 +518,18 @@ export function getSessionEvents(sessionId, limit) {
 }
 
 /**
- * 임베딩 생성 (배치)
- * Transformers.js의 paraphrase-multilingual-MiniLM-L12-v2 모델 사용
- * - 384차원, 다국어(한국어 포함), 오프라인 실행
- * - 프리픽스 불필요 (paraphrase 모델 특성)
- * - 모델 캐시: ~/.self-generation/models/
+ * 임베딩 생성 (임베딩 데몬 클라이언트)
+ * Unix socket을 통해 상주 임베딩 서버에 요청
+ * 서버 미실행 시 빈 배열 반환 (텍스트 매칭 폴백)
  */
-let _pipeline = null;
-
-async function getEmbeddingPipeline() {
-  if (!_pipeline) {
-    const { pipeline, env } = await import('@xenova/transformers');
-    env.cacheDir = join(homedir(), '.self-generation', 'models');
-    _pipeline = await pipeline('feature-extraction',
-      'Xenova/paraphrase-multilingual-MiniLM-L12-v2');
-  }
-  return _pipeline;
-}
-
 export async function generateEmbeddings(texts) {
   if (!texts || texts.length === 0) return [];
 
   try {
-    const extractor = await getEmbeddingPipeline();
-    const results = [];
-    for (const text of texts) {
-      const output = await extractor(text, { pooling: 'mean', normalize: true });
-      results.push(Array.from(output.data));
-    }
-    return results;
+    const { embedViaServer } = await import('./embedding-client.mjs');
+    return await embedViaServer(texts);
   } catch {
-    return []; // Return empty on model load error
+    return []; // Server not available, fall through to text matching
   }
 }
 
@@ -565,16 +550,21 @@ export function vectorSearch(table, embeddingColumn, queryEmbedding, limit = 5) 
   `).all(embeddingBlob, limit);
 }
 
+/**
+ * stdin 읽기 (비동기)
+ * Claude Code 훅은 JSON 데이터를 stdin으로 전달
+ */
 export function readStdin() {
-  const chunks = [];
-  const fd = openSync('/dev/stdin', 'r');
-  const buf = Buffer.alloc(65536);
-  let n;
-  while ((n = readSync(fd, buf)) > 0) {
-    chunks.push(buf.slice(0, n));
-  }
-  closeSync(fd);
-  return JSON.parse(Buffer.concat(chunks).toString('utf-8'));
+  return new Promise((resolve, reject) => {
+    let data = '';
+    process.stdin.setEncoding('utf-8');
+    process.stdin.on('data', chunk => { data += chunk; });
+    process.stdin.on('end', () => {
+      try { resolve(JSON.parse(data)); }
+      catch (e) { reject(e); }
+    });
+    process.stdin.on('error', reject);
+  });
 }
 
 export function loadConfig() {
@@ -609,7 +599,7 @@ export function pruneOldEvents(retentionDays = RETENTION_DAYS) {
 import { insertEvent, getProjectName, readStdin } from '../lib/db.mjs';
 
 try {
-  const input = readStdin();
+  const input = await readStdin();
 
   const entry = {
     v: 1,
@@ -641,7 +631,7 @@ import { insertEvent, queryEvents, getProjectName, readStdin } from '../lib/db.m
 import { recordResolution } from '../lib/error-kb.mjs';
 
 try {
-  const input = readStdin();
+  const input = await readStdin();
 
   const entry = {
     v: 1,
@@ -763,7 +753,7 @@ function extractToolMeta(tool, toolInput) {
 import { insertEvent, getProjectName, readStdin } from '../lib/db.mjs';
 
 try {
-  const input = readStdin();
+  const input = await readStdin();
 
   const entry = {
     v: 1,
@@ -806,7 +796,7 @@ function normalizeError(error) {
 import { insertEvent, queryEvents, getProjectName, readStdin } from '../lib/db.mjs';
 
 try {
-  const input = readStdin();
+  const input = await readStdin();
 
   // 이 세션의 이벤트들을 집계 (SQL 인덱스 기반, 전체 스캔 불필요)
   const sessionEntries = queryEvents({ sessionId: input.session_id });
@@ -1179,7 +1169,7 @@ import { insertEvent, queryEvents, getProjectName, getDb, readStdin } from '../l
 import { runAnalysisAsync } from '../lib/ai-analyzer.mjs';
 
 try {
-  const input = readStdin();
+  const input = await readStdin();
 
   // P8: 비정상/미니멀 세션은 AI 분석 생략 (v7)
   const skipAnalysis = input.reason === 'clear' || false;
@@ -1266,7 +1256,7 @@ import { readStdin } from '../lib/db.mjs';
 import { getCachedAnalysis } from '../lib/ai-analyzer.mjs';
 
 try {
-  const input = readStdin();
+  const input = await readStdin();
 
   // 캐시된 AI 분석 결과 조회 (24시간 이내, DB 기반)
   const analysis = getCachedAnalysis(24);
@@ -1931,7 +1921,7 @@ import { insertEvent, getProjectName, readStdin } from '../lib/db.mjs';
 import { normalizeError, searchErrorKB } from '../lib/error-kb.mjs';
 
 try {
-  const input = readStdin();
+  const input = await readStdin();
 
   const normalized = normalizeError(input.error || '');
 
@@ -1969,6 +1959,172 @@ try {
   process.exit(0);
 }
 // normalizeError()는 error-kb.mjs에서 import (단일 소유자 원칙)
+```
+
+### 8.1.1 임베딩 데몬 (embedding-server.mjs)
+
+Transformers.js 모델을 메모리에 상주시키는 백그라운드 서버. 훅 프로세스는 매 호출마다 새로 생성되므로,
+모델 로딩(1~4초)을 매번 반복하는 대신 상주 프로세스의 소켓 인터페이스를 통해 ~5ms로 임베딩을 생성한다.
+
+```javascript
+// ~/.self-generation/lib/embedding-server.mjs
+import { createServer } from 'net';
+import { pipeline, env } from '@xenova/transformers';
+import { join } from 'path';
+import { homedir } from 'os';
+import { unlinkSync, existsSync } from 'fs';
+
+const SOCKET_PATH = '/tmp/self-gen-embed.sock';
+const IDLE_TIMEOUT_MS = 30 * 60 * 1000; // 30 minutes
+
+// Model initialization
+env.cacheDir = join(homedir(), '.self-generation', 'models');
+let extractor = null;
+let idleTimer = null;
+
+async function init() {
+  console.error('[embedding-server] Loading model...');
+  extractor = await pipeline('feature-extraction',
+    'Xenova/paraphrase-multilingual-MiniLM-L12-v2');
+  console.error('[embedding-server] Model loaded, ready for requests');
+}
+
+async function embed(texts) {
+  const results = [];
+  for (const text of texts) {
+    const output = await extractor(text, { pooling: 'mean', normalize: true });
+    results.push(Array.from(output.data));
+  }
+  return results;
+}
+
+function resetIdleTimer() {
+  if (idleTimer) clearTimeout(idleTimer);
+  idleTimer = setTimeout(() => {
+    console.error('[embedding-server] Idle timeout, shutting down');
+    server.close();
+    process.exit(0);
+  }, IDLE_TIMEOUT_MS);
+}
+
+// Clean up stale socket
+if (existsSync(SOCKET_PATH)) unlinkSync(SOCKET_PATH);
+
+const server = createServer((conn) => {
+  resetIdleTimer();
+  let data = '';
+  conn.on('data', chunk => { data += chunk; });
+  conn.on('end', async () => {
+    try {
+      const req = JSON.parse(data);
+      if (req.action === 'health') {
+        conn.end(JSON.stringify({ status: 'ok' }));
+      } else if (req.action === 'embed' && req.texts) {
+        const embeddings = await embed(req.texts);
+        conn.end(JSON.stringify({ embeddings }));
+      } else {
+        conn.end(JSON.stringify({ error: 'unknown action' }));
+      }
+    } catch (e) {
+      conn.end(JSON.stringify({ error: e.message }));
+    }
+  });
+});
+
+// Initialize model, then start listening
+await init();
+server.listen(SOCKET_PATH, () => {
+  console.error(`[embedding-server] Listening on ${SOCKET_PATH}`);
+  resetIdleTimer();
+});
+
+// Graceful shutdown
+process.on('SIGTERM', () => { server.close(); process.exit(0); });
+process.on('SIGINT', () => { server.close(); process.exit(0); });
+```
+
+### 8.1.2 임베딩 클라이언트 (embedding-client.mjs)
+
+훅 프로세스에서 임베딩 데몬과 통신하는 경량 클라이언트. 2초 타임아웃 내 응답을 보장한다.
+
+```javascript
+// ~/.self-generation/lib/embedding-client.mjs
+import { createConnection } from 'net';
+
+const SOCKET_PATH = '/tmp/self-gen-embed.sock';
+const TIMEOUT_MS = 2000;
+
+/**
+ * 임베딩 데몬에 벡터 생성 요청
+ * @param {string[]} texts - 임베딩할 텍스트 배열
+ * @returns {number[][]} - 384차원 벡터 배열
+ */
+export function embedViaServer(texts) {
+  return new Promise((resolve, reject) => {
+    const conn = createConnection(SOCKET_PATH);
+    const timer = setTimeout(() => {
+      conn.destroy();
+      reject(new Error('Embedding server timeout'));
+    }, TIMEOUT_MS);
+
+    let data = '';
+    conn.on('data', chunk => { data += chunk; });
+    conn.on('end', () => {
+      clearTimeout(timer);
+      try {
+        const res = JSON.parse(data);
+        if (res.embeddings) resolve(res.embeddings);
+        else reject(new Error(res.error || 'No embeddings'));
+      } catch (e) { reject(e); }
+    });
+    conn.on('error', (e) => {
+      clearTimeout(timer);
+      reject(e);
+    });
+
+    conn.write(JSON.stringify({ action: 'embed', texts }));
+    conn.end();
+  });
+}
+
+/**
+ * 임베딩 데몬 상태 확인
+ * @returns {Promise<boolean>}
+ */
+export function isServerRunning() {
+  return new Promise((resolve) => {
+    const conn = createConnection(SOCKET_PATH);
+    const timer = setTimeout(() => { conn.destroy(); resolve(false); }, 500);
+    conn.on('error', () => { clearTimeout(timer); resolve(false); });
+    conn.on('connect', () => {
+      let data = '';
+      conn.on('data', chunk => { data += chunk; });
+      conn.on('end', () => {
+        clearTimeout(timer);
+        try {
+          resolve(JSON.parse(data).status === 'ok');
+        } catch { resolve(false); }
+      });
+      conn.write(JSON.stringify({ action: 'health' }));
+      conn.end();
+    });
+  });
+}
+
+/**
+ * 임베딩 데몬 시작 (detached background)
+ */
+export async function startServer() {
+  const { spawn } = await import('child_process');
+  const { join } = await import('path');
+  const { homedir } = await import('os');
+  const serverPath = join(homedir(), '.self-generation', 'lib', 'embedding-server.mjs');
+  const child = spawn('node', [serverPath], {
+    detached: true,
+    stdio: 'ignore'
+  });
+  child.unref();
+}
 ```
 
 ### 8.2 스킬 자동 감지
@@ -2093,7 +2249,7 @@ import { insertEvent, getProjectName, readStdin } from '../lib/db.mjs';
 import { loadSkills, matchSkill } from '../lib/skill-matcher.mjs';
 
 try {
-  const input = readStdin();
+  const input = await readStdin();
 
   // 1. 프롬프트 기록 (events 테이블에 INSERT)
   const entry = {
@@ -2152,7 +2308,7 @@ try {
 import { insertEvent, getProjectName, readStdin } from '../lib/db.mjs';
 
 try {
-  const input = readStdin();
+  const input = await readStdin();
 
   const entry = {
     v: 1,
@@ -2184,7 +2340,7 @@ import { queryEvents, getProjectName, readStdin } from '../lib/db.mjs';
 import { getCachedAnalysis } from '../lib/ai-analyzer.mjs';
 
 try {
-  const input = readStdin();
+  const input = await readStdin();
   const project = getProjectName(input.cwd);
 
   // P7: 세션 소스에 따른 컨텍스트 분기 (v7)
@@ -2238,6 +2394,14 @@ try {
     contextParts.push(parts.join('\n'));
   }
 
+  // 임베딩 데몬 자동 시작
+  try {
+    const { isServerRunning, startServer } = await import('../lib/embedding-client.mjs');
+    if (!await isServerRunning()) {
+      await startServer();
+    }
+  } catch { /* Embedding daemon optional */ }
+
   if (contextParts.length > 0) {
     const output = {
       hookSpecificOutput: {
@@ -2264,7 +2428,7 @@ import { searchErrorKB } from '../lib/error-kb.mjs';
 import { queryEvents, getDb, readStdin } from '../lib/db.mjs';
 
 try {
-  const input = readStdin();
+  const input = await readStdin();
   const parts = [];
 
   // 1. Edit/Write 도구: 대상 파일 관련 과거 에러 검색
@@ -2353,7 +2517,7 @@ const CODE_AGENTS = ['executor', 'executor-low', 'executor-high', 'architect', '
   'designer', 'designer-high', 'build-fixer', 'build-fixer-low'];
 
 try {
-  const input = readStdin();
+  const input = await readStdin();
   const agentType = input.agent_type || '';
 
   // 코드 작업 에이전트에만 컨텍스트 주입
@@ -2535,8 +2699,9 @@ CREATE INDEX IF NOT EXISTS idx_error_kb_error ON error_kb(error_normalized);
 ```
 
 > **임베딩 전략**: `embedding` 컬럼은 INSERT 시 NULL로 저장되고,
-> SessionEnd 배치에서 Transformers.js (`paraphrase-multilingual-MiniLM-L12-v2`)를 통해 생성된다.
-> 검색 시 임베딩이 없으면 텍스트 매칭으로 폴백한다.
+> SessionEnd 배치에서 임베딩 데몬을 통해 비동기 생성된다.
+> 실시간 훅의 벡터 검색도 임베딩 데몬(Unix socket)을 통해 ~5ms로 처리된다.
+> 데몬 미실행 시 텍스트 매칭(정확+접두사)으로 폴백한다.
 > 임계값: distance < 0.76 (고신뢰), 0.76~0.85 (저신뢰+키워드 검증), >= 0.85 (매칭 없음)
 
 ### 9.3 feedback 테이블 (제안 피드백)
@@ -2605,7 +2770,12 @@ CREATE TABLE IF NOT EXISTS skill_embeddings (
     "dimensions": 384,
     "threshold": 0.76,
     "batchSize": 50,
-    "modelCacheDir": "~/.self-generation/models/"
+    "modelCacheDir": "~/.self-generation/models/",
+    "server": {
+      "socketPath": "/tmp/self-gen-embed.sock",
+      "idleTimeoutMinutes": 30,
+      "clientTimeoutMs": 2000
+    }
   }
 }
 ```
@@ -2748,11 +2918,13 @@ VALUES (1, 'prompt', '...', 'abc', 'my-app', '/path/to/my-app',
 작업:
   1. lib/error-kb.mjs (에러 KB 벡터 검색/기록, error_kb 테이블)
   2. lib/skill-matcher.mjs (벡터 기반 스킬-프롬프트 매칭, skill_embeddings 테이블)
-  3. hooks/error-logger.mjs 확장 (에러 KB 실시간 벡터 검색)
-  4. hooks/prompt-logger.mjs 확장 (스킬 자동 감지)
-  5. hooks/subagent-tracker.mjs (서브에이전트 성능 추적)
-  6. hooks/session-analyzer.mjs 확장 (이전 세션 컨텍스트 주입)
-  7. 테스트: 에러 재발 시 KB 즉시 안내 확인 (벡터 + 텍스트 폴백)
+  3. lib/embedding-server.mjs (임베딩 데몬 서버, Unix socket, 모델 상주)
+  4. lib/embedding-client.mjs (임베딩 클라이언트, 훅용 소켓 통신)
+  5. hooks/error-logger.mjs 확장 (에러 KB 실시간 벡터 검색)
+  6. hooks/prompt-logger.mjs 확장 (스킬 자동 감지)
+  7. hooks/subagent-tracker.mjs (서브에이전트 성능 추적)
+  8. hooks/session-analyzer.mjs 확장 (이전 세션 컨텍스트 주입 + 임베딩 데몬 자동 시작)
+  9. 테스트: 에러 재발 시 KB 즉시 안내 확인 (벡터 + 텍스트 폴백)
 
 산출물:
   - 에러 발생 즉시 벡터 유사도 기반 해결 이력 안내
