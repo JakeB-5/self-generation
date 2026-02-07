@@ -27,7 +27,8 @@ skill-matcher는 사용자가 입력한 프롬프트를 분석하여, 이미 생
 
 ```sql
 CREATE TABLE skill_embeddings (
-  name TEXT PRIMARY KEY,           -- skill file name (without .md)
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL UNIQUE,       -- skill file name (without .md)
   source_path TEXT NOT NULL,       -- full path to skill file
   description TEXT,                -- extracted description from skill file
   keywords TEXT,                   -- JSON array of extracted keywords
@@ -36,7 +37,7 @@ CREATE TABLE skill_embeddings (
 
 -- Vector search virtual table (sqlite-vec)
 CREATE VIRTUAL TABLE vec_skill_embeddings USING vec0(
-  skill_name TEXT PRIMARY KEY,     -- references skill_embeddings.name
+  skill_id INTEGER PRIMARY KEY,   -- references skill_embeddings.id
   embedding float[384]
 );
 ```
@@ -89,7 +90,7 @@ CREATE VIRTUAL TABLE vec_skill_embeddings USING vec0(
    ```sql
    SELECT s.name, s.source_path, s.description, v.distance
    FROM vec_skill_embeddings v
-   INNER JOIN skill_embeddings s ON s.name = v.skill_name
+   INNER JOIN skill_embeddings s ON s.id = v.skill_id
    WHERE v.embedding MATCH ? AND k = 1
    ORDER BY v.distance
    ```
@@ -132,7 +133,7 @@ CREATE VIRTUAL TABLE vec_skill_embeddings USING vec0(
 2. 해당 스킬의 description + keywords 텍스트로 `await generateEmbeddings()`를 호출하여 벡터를 생성한다(SHALL) — Transformers.js 비동기 처리
 3. 생성된 벡터를 `vec_skill_embeddings` 가상 테이블에 저장하고 `updated_at`을 갱신한다(SHALL)
    ```sql
-   INSERT OR REPLACE INTO vec_skill_embeddings (skill_name, embedding) VALUES (?, ?);
+   INSERT OR REPLACE INTO vec_skill_embeddings (skill_id, embedding) VALUES (?, ?);
    UPDATE skill_embeddings SET updated_at = ? WHERE name = ?;
    ```
 4. 임베딩 생성 실패 시 해당 스킬을 건너뛰고 다음 스킬을 계속 처리해야 한다(SHALL)

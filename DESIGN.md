@@ -429,7 +429,8 @@ export function initDb(db) {
 
     -- Skill embeddings table (for vector skill matching)
     CREATE TABLE IF NOT EXISTS skill_embeddings (
-      name TEXT PRIMARY KEY,
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL UNIQUE,
       source_path TEXT NOT NULL,
       description TEXT,
       keywords TEXT,
@@ -442,7 +443,7 @@ export function initDb(db) {
       embedding float[384]
     );
     CREATE VIRTUAL TABLE IF NOT EXISTS vec_skill_embeddings USING vec0(
-      skill_name TEXT PRIMARY KEY,
+      skill_id INTEGER PRIMARY KEY,
       embedding float[384]
     );
   `);
@@ -561,7 +562,7 @@ export function vectorSearch(table, vecTable, queryEmbedding, limit = 5) {
     return db.prepare(`
       SELECT s.*, v.distance
       FROM vec_skill_embeddings v
-      INNER JOIN skill_embeddings s ON s.name = v.skill_name
+      INNER JOIN skill_embeddings s ON s.id = v.skill_id
       WHERE v.embedding MATCH ? AND k = ?
       ORDER BY v.distance
     `).all(embeddingBlob, limit);
@@ -655,15 +656,18 @@ try {
 > 이 작업들은 AI 분석 단계(`claude --print`)에서 의미 기반으로 수행하므로
 > 수집 훅은 원본 데이터만 빠르게 기록하는 역할에 집중한다.
 
+> **주의**: 위 Phase 1 `prompt-logger.mjs`는 8.2절의 v6 확장 버전으로 **완전 교체**된다. Phase 1과 v6를 병합하지 말 것 — v6 버전이 최종본이다.
+
 ### 4.4 도구 사용 수집 훅 (PostToolUse)
 
 ```javascript
 // ~/.self-generation/hooks/tool-logger.mjs
-import { insertEvent, queryEvents, getProjectName, readStdin } from '../lib/db.mjs';
+import { insertEvent, queryEvents, getProjectName, readStdin, isEnabled } from '../lib/db.mjs';
 import { recordResolution } from '../lib/error-kb.mjs';
 
 try {
   const input = await readStdin();
+  if (!isEnabled()) process.exit(0);
 
   const entry = {
     v: 1,
@@ -782,48 +786,18 @@ function extractToolMeta(tool, toolInput) {
 
 ```javascript
 // ~/.self-generation/hooks/error-logger.mjs
-import { insertEvent, getProjectName, readStdin } from '../lib/db.mjs';
-
-try {
-  const input = await readStdin();
-
-  const entry = {
-    v: 1,
-    type: 'tool_error',
-    ts: new Date().toISOString(),
-    sessionId: input.session_id,
-    project: getProjectName(input.cwd),
-    projectPath: input.cwd,
-    tool: input.tool_name,
-    error: normalizeError(input.error || ''),
-    errorRaw: (input.error || '').slice(0, 500)
-  };
-
-  insertEvent(entry);
-  process.exit(0);
-} catch (e) {
-  process.exit(0);
-}
-
-function normalizeError(error) {
-  // 정규화 순서: 경로 → 숫자 → 문자열 (순서 의존적: 숫자가 먼저 치환되므로 문자열 내 숫자도 치환됨)
-  return error
-    .replace(/\/[\w/.\-@]+/g, '<PATH>')
-    .replace(/\d{2,}/g, '<N>')
-    .replace(/'[^']{0,100}'/g, '<STR>')
-    .replace(/"[^"]{0,100}"/g, '<STR>')
-    .slice(0, 200)
-    .trim();
-}
+// 최종 구현은 8.3절의 v6 확장 버전(에러 KB 검색 포함)을 사용한다.
+// Phase 1에서도 v6 버전을 구현하라. 에러 KB 검색이 실패하면 자동으로 무시된다(try/catch).
+// → 8.3절 참조
 ```
 
 > **주의**: 위 Phase 1 `error-logger.mjs`는 8.3절의 v6 확장 버전으로 **완전 교체**된다. Phase 1과 v6를 병합하지 말 것 — v6 버전이 최종본이다.
 
 ### 4.6 세션 요약 훅 (SessionEnd)
 
-> **참고 (v5)**: 이 훅은 세션 요약만 기록한다. AI 분석 트리거는 Phase 2의
-> session-summary.mjs 확장판(5.4절)에서 담당한다. 구현 시 이 기본 버전을
-> 5.4절 코드로 교체하면 된다.
+> **참고 (v5)**: 이 훅은 세션 요약만 기록한다. AI 분석 트리거와 임베딩 배치 생성은
+> session-summary.mjs 확장판(5.4절)에서 담당한다. **구현 시 이 기본 버전을
+> 5.4절의 최종 버전(임베딩 배치 포함)으로 완전 교체한다.**
 
 ```javascript
 // ~/.self-generation/hooks/session-summary.mjs (기본 버전, Phase 1용)
@@ -1033,7 +1007,8 @@ export function runAnalysis(options = {}) {
 
   const since = new Date(Date.now() - days * 86400000).toISOString();
   const filter = { since };
-  if (project) filter.project = project;
+  if (projectPath) filter.projectPath = projectPath;
+  else if (project) filter.project = project;
 
   const entries = queryEvents(filter);
 
@@ -1200,11 +1175,12 @@ function extractJSON(text) {
 
 ```javascript
 // ~/.self-generation/hooks/session-summary.mjs
-import { insertEvent, queryEvents, getProjectName, getDb, readStdin } from '../lib/db.mjs';
+import { insertEvent, queryEvents, getProjectName, getDb, readStdin, generateEmbeddings, isEnabled } from '../lib/db.mjs';
 import { runAnalysisAsync } from '../lib/ai-analyzer.mjs';
 
 try {
   const input = await readStdin();
+  if (!isEnabled()) process.exit(0);
 
   // P8: 비정상/미니멀 세션은 AI 분석 생략 (v7)
   const skipAnalysis = input.reason === 'clear' || false;
@@ -1284,6 +1260,28 @@ try {
     }
   } catch { /* Embedding generation failure is non-critical */ }
 
+  // v8: 스킬 임베딩 갱신
+  try {
+    const { loadSkills, extractPatterns } = await import('../lib/skill-matcher.mjs');
+    const skills = loadSkills(input.cwd);
+    const db = getDb();
+
+    for (const skill of skills) {
+      const text = skill.content.slice(0, 500);
+      const info = db.prepare(`
+        INSERT OR REPLACE INTO skill_embeddings (name, source_path, description, keywords, updated_at)
+        VALUES (?, ?, ?, ?, ?)
+      `).run(skill.name, skill.sourcePath, skill.description || null, JSON.stringify(extractPatterns(skill.content)), new Date().toISOString());
+      const skillId = info.lastInsertRowid || db.prepare('SELECT id FROM skill_embeddings WHERE name = ?').get(skill.name)?.id;
+
+      const embeddings = await generateEmbeddings([text]);
+      if (embeddings?.[0] && skillId) {
+        const embeddingBlob = Buffer.from(new Float32Array(embeddings[0]).buffer);
+        db.prepare('INSERT OR REPLACE INTO vec_skill_embeddings (skill_id, embedding) VALUES (?, ?)').run(skillId, embeddingBlob);
+      }
+    }
+  } catch { /* Skill embedding generation is non-critical */ }
+
   process.exit(0);
 } catch (e) {
   process.exit(0);
@@ -1342,10 +1340,11 @@ import { runAnalysis } from '../lib/ai-analyzer.mjs';
 const args = process.argv.slice(2);
 const days = parseInt(args.find((_, i, a) => a[i - 1] === '--days') || '30');
 const project = args.find((_, i, a) => a[i - 1] === '--project') || null;
+const projectPath = args.find((_, i, a) => a[i - 1] === '--project-path') || null;
 
 console.log(`\n=== Self-Generation AI 패턴 분석 (최근 ${days}일) ===\n`);
 
-const result = runAnalysis({ days, project });
+const result = runAnalysis({ days, project, projectPath });
 
 if (result.error) {
   console.error(`분석 실패: ${result.error}`);
@@ -1960,11 +1959,12 @@ export function recordResolution(normalizedError, resolution) {
 
 ```javascript
 // ~/.self-generation/hooks/error-logger.mjs (v6 확장)
-import { insertEvent, getProjectName, readStdin } from '../lib/db.mjs';
+import { insertEvent, getProjectName, readStdin, isEnabled } from '../lib/db.mjs';
 import { normalizeError, searchErrorKB } from '../lib/error-kb.mjs';
 
 try {
   const input = await readStdin();
+  if (!isEnabled()) process.exit(0);
 
   const normalized = normalizeError(input.error || '');
 
@@ -2209,11 +2209,9 @@ export function loadSkills(projectPath) {
   if (existsSync(globalDir)) {
     for (const file of readdirSync(globalDir)) {
       if (file.endsWith('.md')) {
-        skills.push({
-          name: file.replace('.md', ''),
-          scope: 'global',
-          content: readFileSync(join(globalDir, file), 'utf-8')
-        });
+        const content = readFileSync(join(globalDir, file), 'utf-8');
+        const firstParagraph = content.split('\n').find(l => l.trim() && !l.startsWith('#'));
+        skills.push({ name: file.replace('.md', ''), scope: 'global', content, description: firstParagraph?.trim() || null, sourcePath: join(globalDir, file) });
       }
     }
   }
@@ -2224,11 +2222,9 @@ export function loadSkills(projectPath) {
     if (existsSync(projectDir)) {
       for (const file of readdirSync(projectDir)) {
         if (file.endsWith('.md')) {
-          skills.push({
-            name: file.replace('.md', ''),
-            scope: 'project',
-            content: readFileSync(join(projectDir, file), 'utf-8')
-          });
+          const content = readFileSync(join(projectDir, file), 'utf-8');
+          const firstParagraph = content.split('\n').find(l => l.trim() && !l.startsWith('#'));
+          skills.push({ name: file.replace('.md', ''), scope: 'project', content, description: firstParagraph?.trim() || null, sourcePath: join(projectDir, file) });
         }
       }
     }
@@ -2306,11 +2302,15 @@ function extractPatterns(content) {
 
 ```javascript
 // ~/.self-generation/hooks/prompt-logger.mjs (v6 확장)
-import { insertEvent, getProjectName, readStdin } from '../lib/db.mjs';
+import { insertEvent, getProjectName, readStdin, isEnabled, loadConfig } from '../lib/db.mjs';
 import { loadSkills, matchSkill } from '../lib/skill-matcher.mjs';
 
 try {
   const input = await readStdin();
+  if (!isEnabled()) process.exit(0);
+
+  const config = loadConfig();
+  const promptText = config.collectPromptText === false ? '[REDACTED]' : input.prompt;
 
   // 1. 프롬프트 기록 (events 테이블에 INSERT)
   const entry = {
@@ -2320,8 +2320,8 @@ try {
     sessionId: input.session_id,
     project: getProjectName(input.cwd),
     projectPath: input.cwd,
-    text: input.prompt,
-    charCount: input.prompt.length
+    text: promptText,
+    charCount: promptText.length
   };
   insertEvent(entry);
 
@@ -2366,10 +2366,11 @@ try {
 
 ```javascript
 // ~/.self-generation/hooks/subagent-tracker.mjs
-import { insertEvent, getProjectName, readStdin } from '../lib/db.mjs';
+import { insertEvent, getProjectName, readStdin, isEnabled } from '../lib/db.mjs';
 
 try {
   const input = await readStdin();
+  if (!isEnabled()) process.exit(0);
 
   const entry = {
     v: 1,
@@ -2397,11 +2398,12 @@ SessionStart에서 이전 세션의 핵심 정보를 주입하여 세션 연속�
 
 ```javascript
 // ~/.self-generation/hooks/session-analyzer.mjs (v6 확장)
-import { queryEvents, getProjectName, readStdin } from '../lib/db.mjs';
+import { queryEvents, getProjectName, readStdin, isEnabled } from '../lib/db.mjs';
 import { getCachedAnalysis } from '../lib/ai-analyzer.mjs';
 
 try {
   const input = await readStdin();
+  if (!isEnabled()) process.exit(0);
   const project = getProjectName(input.cwd);
 
   // P7: 세션 소스에 따른 컨텍스트 분기 (v7)
@@ -2423,8 +2425,7 @@ try {
   }
 
   // 2. 이전 세션 컨텍스트 주입 (v6 추가, SQL 인덱스 기반 조회)
-  const recentSummaries = queryEvents({ type: 'session_summary', projectPath: input.cwd, limit: 1 })
-    .slice(-1); // 가장 최근 세션 요약 1개
+  const recentSummaries = queryEvents({ type: 'session_summary', projectPath: input.cwd, limit: 1 });
 
   if (recentSummaries.length > 0) {
     const prev = recentSummaries[0];
@@ -2486,10 +2487,11 @@ try {
 ```javascript
 // ~/.self-generation/hooks/pre-tool-guide.mjs
 import { searchErrorKB } from '../lib/error-kb.mjs';
-import { queryEvents, getDb, readStdin } from '../lib/db.mjs';
+import { queryEvents, getDb, readStdin, isEnabled } from '../lib/db.mjs';
 
 try {
   const input = await readStdin();
+  if (!isEnabled()) process.exit(0);
   const parts = [];
 
   // 1. Edit/Write 도구: 대상 파일 관련 과거 에러 검색
@@ -2575,7 +2577,7 @@ try {
 ```javascript
 // ~/.self-generation/hooks/subagent-context.mjs
 import { searchErrorKB } from '../lib/error-kb.mjs';
-import { queryEvents, getProjectName, readStdin } from '../lib/db.mjs';
+import { queryEvents, getProjectName, readStdin, isEnabled } from '../lib/db.mjs';
 import { getCachedAnalysis } from '../lib/ai-analyzer.mjs';
 
 const CODE_AGENTS = ['executor', 'executor-low', 'executor-high', 'architect', 'architect-medium',
@@ -2583,6 +2585,7 @@ const CODE_AGENTS = ['executor', 'executor-low', 'executor-high', 'architect', '
 
 try {
   const input = await readStdin();
+  if (!isEnabled()) process.exit(0);
   const agentType = input.agent_type || '';
 
   // 코드 작업 에이전트에만 컨텍스트 주입
@@ -2615,7 +2618,7 @@ try {
       .slice(0, 3);
     if (rules.length > 0) {
       parts.push('적용할 프로젝트 규칙:');
-      rules.forEach(r => parts.push(`- ${r.content || r.description}`));
+      rules.forEach(r => parts.push(`- ${r.rule || r.summary}`));
     }
   }
 
@@ -2811,7 +2814,8 @@ CREATE TABLE IF NOT EXISTS analysis_cache (
 
 ```sql
 CREATE TABLE IF NOT EXISTS skill_embeddings (
-  name TEXT PRIMARY KEY,            -- 스킬 이름
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL UNIQUE,         -- 스킬 이름
   source_path TEXT NOT NULL,        -- 스킬 파일 경로
   description TEXT,                 -- 스킬 설명
   keywords TEXT,                    -- 추출된 키워드 (JSON array)
@@ -2820,7 +2824,7 @@ CREATE TABLE IF NOT EXISTS skill_embeddings (
 
 -- Vector search virtual table (sqlite-vec)
 CREATE VIRTUAL TABLE IF NOT EXISTS vec_skill_embeddings USING vec0(
-  skill_name TEXT PRIMARY KEY,
+  skill_id INTEGER PRIMARY KEY,
   embedding float[384]
 );
 ```
