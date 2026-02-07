@@ -1,0 +1,51 @@
+#!/bin/sh
+# SDD commit-msg hook
+# 커밋 메시지 형식을 검증합니다
+
+# 색상 정의
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+NC='\033[0m'
+
+COMMIT_MSG_FILE=$1
+COMMIT_MSG=$(cat "$COMMIT_MSG_FILE")
+
+# 빈 줄과 주석 제거
+COMMIT_MSG_CLEAN=$(echo "$COMMIT_MSG" | grep -v "^#" | grep -v "^$" | head -1)
+
+# 스펙 커밋 패턴
+SPEC_PATTERN="^(spec|spec-update|spec-status|plan|tasks|constitution|sdd-config)(\(.+\))?: .+"
+
+# 일반 커밋 패턴 (Conventional Commits)
+GENERAL_PATTERN="^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\(.+\))?: .+"
+
+# 머지 커밋 패턴
+MERGE_PATTERN="^Merge "
+
+# 리버트 커밋 패턴
+REVERT_PATTERN="^Revert "
+
+# 패턴 검사
+if echo "$COMMIT_MSG_CLEAN" | grep -qE "$SPEC_PATTERN"; then
+  echo "${GREEN}✅ 스펙 커밋 형식 확인됨${NC}"
+  exit 0
+elif echo "$COMMIT_MSG_CLEAN" | grep -qE "$GENERAL_PATTERN"; then
+  echo "${GREEN}✅ Conventional Commit 형식 확인됨${NC}"
+  exit 0
+elif echo "$COMMIT_MSG_CLEAN" | grep -qE "$MERGE_PATTERN"; then
+  exit 0
+elif echo "$COMMIT_MSG_CLEAN" | grep -qE "$REVERT_PATTERN"; then
+  exit 0
+else
+  echo "${RED}❌ 커밋 메시지 형식 오류${NC}"
+  echo ""
+  echo "올바른 형식:"
+  echo "  스펙 커밋: spec(<scope>): <message>"
+  echo "  일반 커밋: feat(<scope>): <message>"
+  echo ""
+  echo "스펙 타입: spec, spec-update, spec-status, plan, tasks, constitution, sdd-config"
+  echo "일반 타입: feat, fix, docs, style, refactor, perf, test, build, ci, chore, revert"
+  echo ""
+  echo "자세한 내용: docs/guide/commit-convention.md"
+  exit 1
+fi

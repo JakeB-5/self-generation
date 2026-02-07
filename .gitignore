@@ -1,0 +1,26 @@
+# Dependencies
+node_modules/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# OMC (oh-my-claudecode state)
+.omc/
+
+# Environment
+.env
+.env.*
+
+# Build output
+dist/
+build/
+
+# Logs
+*.log

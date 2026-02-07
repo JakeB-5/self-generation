@@ -1,0 +1,89 @@
+#!/bin/sh
+# Self-Generation pre-push hook
+# 푸시 전 전체 검증 수행
+
+# 색상 정의
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
+
+ERRORS=0
+
+echo "${YELLOW}pre-push: 푸시 전 검증 시작${NC}"
+echo ""
+
+# 1. SDD 스펙 검증
+echo "${YELLOW}[1/4] 스펙 검증 중...${NC}"
+if command -v sdd &> /dev/null; then
+  sdd validate --ci
+  if [ $? -ne 0 ]; then
+    echo "${RED}  스펙 검증 실패${NC}"
+    ERRORS=$((ERRORS + 1))
+  else
+    echo "${GREEN}  스펙 검증 통과${NC}"
+  fi
+
+  # Constitution 정합성 확인
+  sdd validate --constitution --ci 2>/dev/null
+  if [ $? -ne 0 ]; then
+    echo "${YELLOW}  Constitution 검증 경고 (계속 진행)${NC}"
+  fi
+else
+  echo "${YELLOW}  sdd 명령어 없음 - 건너뜀${NC}"
+fi
+
+# 2. 모든 .mjs 파일 문법 검사
+echo "${YELLOW}[2/4] 전체 ESM 문법 검사 중...${NC}"
+MJS_ERRORS=0
+for f in $(find . -name '*.mjs' -not -path './node_modules/*' -not -path './.git/*' 2>/dev/null); do
+  node --check "$f" 2>/dev/null
+  if [ $? -ne 0 ]; then
+    echo "${RED}  구문 오류: $f${NC}"
+    MJS_ERRORS=$((MJS_ERRORS + 1))
+  fi
+done
+if [ $MJS_ERRORS -gt 0 ]; then
+  echo "${RED}  $MJS_ERRORS개 파일에서 구문 오류${NC}"
+  ERRORS=$((ERRORS + MJS_ERRORS))
+else
+  echo "${GREEN}  ESM 문법 검사 통과${NC}"
+fi
+
+# 3. 테스트 실행
+echo "${YELLOW}[3/4] 테스트 실행 중...${NC}"
+if [ -f "package.json" ] && node -e "const p=JSON.parse(require('fs').readFileSync('package.json','utf8')); process.exit(p.scripts && p.scripts.test ? 0 : 1)" 2>/dev/null; then
+  npm test 2>&1
+  if [ $? -ne 0 ]; then
+    echo "${RED}  테스트 실패${NC}"
+    ERRORS=$((ERRORS + 1))
+  else
+    echo "${GREEN}  테스트 통과${NC}"
+  fi
+else
+  echo "${YELLOW}  테스트 스크립트 없음 - 건너뜀${NC}"
+fi
+
+# 4. 제로 의존성 최종 검증
+echo "${YELLOW}[4/4] 제로 의존성 최종 검증 중...${NC}"
+if [ -f "package.json" ]; then
+  DEPS=$(node -e "const p=JSON.parse(require('fs').readFileSync('package.json','utf8')); console.log(Object.keys(p.dependencies||{}).length)" 2>/dev/null)
+  if [ "$DEPS" != "0" ] && [ -n "$DEPS" ]; then
+    echo "${RED}  외부 dependencies 감지 ($DEPS개). 푸시 차단.${NC}"
+    ERRORS=$((ERRORS + 1))
+  else
+    echo "${GREEN}  제로 의존성 확인${NC}"
+  fi
+else
+  echo "${GREEN}  package.json 없음 - 통과${NC}"
+fi
+
+# 결과
+echo ""
+if [ $ERRORS -gt 0 ]; then
+  echo "${RED}pre-push: $ERRORS개 오류 발견. 푸시가 취소됩니다.${NC}"
+  exit 1
+fi
+
+echo "${GREEN}pre-push: 모든 검증 통과${NC}"
+exit 0

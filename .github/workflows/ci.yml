@@ -1,0 +1,92 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master, develop]
+  pull_request:
+    branches: [main, master, develop]
+
+jobs:
+  lint-and-test:
+    name: Lint & Test
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node-version: [18, 20, 22]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+
+      - name: Verify no external dependencies
+        run: |
+          if [ -f package.json ]; then
+            DEPS=$(node -e "const p=require('./package.json'); console.log(Object.keys(p.dependencies||{}).length)")
+            if [ "$DEPS" -gt 0 ]; then
+              echo "::error::External dependencies detected. This project requires zero npm dependencies."
+              exit 1
+            fi
+          fi
+
+      - name: Run tests
+        run: |
+          if [ -f package.json ] && node -e "const p=require('./package.json'); process.exit(p.scripts?.test ? 0 : 1)" 2>/dev/null; then
+            npm test
+          else
+            echo "No test script found. Skipping."
+          fi
+
+      - name: Check ES Module syntax
+        run: |
+          # Verify all .mjs files have valid syntax
+          find . -name '*.mjs' -not -path './node_modules/*' | while read f; do
+            node --check "$f" || exit 1
+          done
+
+  hooks-validation:
+    name: Validate Hook Scripts
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Validate hook script syntax
+        run: |
+          HOOK_DIR="hooks"
+          if [ -d "$HOOK_DIR" ]; then
+            for f in "$HOOK_DIR"/*.mjs; do
+              [ -f "$f" ] || continue
+              echo "Checking $f..."
+              node --check "$f"
+            done
+            echo "All hook scripts are syntactically valid."
+          else
+            echo "No hooks directory found. Skipping."
+          fi
+
+      - name: Check hook timeout compliance
+        run: |
+          # Hooks must not use synchronous long-running operations
+          HOOK_DIR="hooks"
+          if [ -d "$HOOK_DIR" ]; then
+            for f in "$HOOK_DIR"/*.mjs; do
+              [ -f "$f" ] || continue
+              if grep -n 'execSync\|spawnSync' "$f"; then
+                echo "::warning file=$f::Synchronous exec detected. Hooks should be non-blocking."
+              fi
+              if grep -n "claude.*--print" "$f" | grep -v 'spawn\|exec(' | grep -v '//' ; then
+                echo "::warning file=$f::Synchronous claude --print call detected. Use async/background execution."
+              fi
+            done
+          fi

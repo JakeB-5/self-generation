@@ -1,0 +1,122 @@
+#!/bin/sh
+# Self-Generation pre-commit hook
+# SDD 스펙 검증 + 코드 품질 검사
+
+# 색상 정의
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # No Color
+
+ERRORS=0
+
+# 1. 변경된 스펙 파일 검증
+CHANGED_SPECS=$(git diff --cached --name-only | grep "^\.sdd/specs/")
+
+if [ -n "$CHANGED_SPECS" ]; then
+  echo "${YELLOW}[1/5] 스펙 검증 중...${NC}"
+  if command -v sdd &> /dev/null; then
+    sdd validate --ci
+    if [ $? -ne 0 ]; then
+      echo "${RED}  스펙 검증 실패${NC}"
+      ERRORS=$((ERRORS + 1))
+    else
+      echo "${GREEN}  스펙 검증 통과${NC}"
+    fi
+  else
+    echo "${YELLOW}  sdd 명령어 없음 - 건너뜀${NC}"
+  fi
+else
+  echo "${YELLOW}[1/5] 스펙 변경 없음 - 건너뜀${NC}"
+fi
+
+# 2. ESM 문법 검사 (.mjs 파일)
+CHANGED_MJS=$(git diff --cached --name-only | grep '\.mjs$')
+
+if [ -n "$CHANGED_MJS" ]; then
+  echo "${YELLOW}[2/5] ESM 문법 검사 중...${NC}"
+  for f in $CHANGED_MJS; do
+    if [ -f "$f" ]; then
+      node --check "$f" 2>/dev/null
+      if [ $? -ne 0 ]; then
+        echo "${RED}  구문 오류: $f${NC}"
+        ERRORS=$((ERRORS + 1))
+      fi
+    fi
+  done
+  if [ $ERRORS -eq 0 ]; then
+    echo "${GREEN}  ESM 문법 검사 통과${NC}"
+  fi
+else
+  echo "${YELLOW}[2/5] .mjs 변경 없음 - 건너뜀${NC}"
+fi
+
+# 3. 제로 의존성 검증
+CHANGED_PKG=$(git diff --cached --name-only | grep "^package\.json$")
+
+if [ -n "$CHANGED_PKG" ]; then
+  echo "${YELLOW}[3/5] 제로 의존성 검증 중...${NC}"
+  DEPS=$(node -e "const p=JSON.parse(require('fs').readFileSync('package.json','utf8')); console.log(Object.keys(p.dependencies||{}).length)" 2>/dev/null)
+  if [ "$DEPS" != "0" ] && [ -n "$DEPS" ]; then
+    echo "${RED}  외부 dependencies 감지 ($DEPS개). Constitution 위반: 제로 의존성 원칙${NC}"
+    ERRORS=$((ERRORS + 1))
+  else
+    echo "${GREEN}  제로 의존성 검증 통과${NC}"
+  fi
+else
+  echo "${YELLOW}[3/5] package.json 변경 없음 - 건너뜀${NC}"
+fi
+
+# 4. 프라이버시 검사 (하드코딩된 경로, 시크릿)
+CHANGED_CODE=$(git diff --cached --name-only | grep -E '\.(mjs|js)$')
+
+if [ -n "$CHANGED_CODE" ]; then
+  echo "${YELLOW}[4/5] 프라이버시 검사 중...${NC}"
+  PRIVACY_WARN=0
+  for f in $CHANGED_CODE; do
+    if [ -f "$f" ]; then
+      # Hardcoded home directory paths
+      if grep -n '/Users/\|/home/' "$f" 2>/dev/null | grep -v '^\s*//' > /dev/null; then
+        echo "${YELLOW}  경고: $f 에 하드코딩된 홈 경로 감지${NC}"
+        PRIVACY_WARN=1
+      fi
+      # Potential secrets
+      if grep -n 'sk-ant-\|api_key=\|API_KEY=' "$f" 2>/dev/null | grep -v '^\s*//' > /dev/null; then
+        echo "${RED}  시크릿 감지: $f${NC}"
+        ERRORS=$((ERRORS + 1))
+      fi
+    fi
+  done
+  if [ $PRIVACY_WARN -eq 0 ] && [ $ERRORS -eq 0 ]; then
+    echo "${GREEN}  프라이버시 검사 통과${NC}"
+  fi
+else
+  echo "${YELLOW}[4/5] 코드 변경 없음 - 건너뜀${NC}"
+fi
+
+# 5. 훅 스크립트 비차단 검증
+CHANGED_HOOKS=$(git diff --cached --name-only | grep "^hooks/.*\.mjs$")
+
+if [ -n "$CHANGED_HOOKS" ]; then
+  echo "${YELLOW}[5/5] 훅 비차단 검증 중...${NC}"
+  for f in $CHANGED_HOOKS; do
+    if [ -f "$f" ]; then
+      if grep -n 'execSync\|spawnSync' "$f" > /dev/null 2>&1; then
+        echo "${YELLOW}  경고: $f 에 동기 실행 감지 (비차단 원칙 위반 가능)${NC}"
+      fi
+    fi
+  done
+  echo "${GREEN}  훅 비차단 검증 완료${NC}"
+else
+  echo "${YELLOW}[5/5] 훅 변경 없음 - 건너뜀${NC}"
+fi
+
+# 결과
+echo ""
+if [ $ERRORS -gt 0 ]; then
+  echo "${RED}pre-commit: $ERRORS개 오류 발견. 커밋이 취소됩니다.${NC}"
+  exit 1
+fi
+
+echo "${GREEN}pre-commit: 모든 검사 통과${NC}"
+exit 0

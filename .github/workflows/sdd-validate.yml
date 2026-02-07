@@ -1,0 +1,38 @@
+# SDD 스펙 검증 워크플로우
+# 이 파일은 sdd init으로 생성되었습니다.
+
+name: SDD Validation
+
+on:
+  push:
+    branches: [main, master, develop]
+    paths:
+      - '.sdd/**'
+  pull_request:
+    branches: [main, master, develop]
+    paths:
+      - '.sdd/**'
+
+jobs:
+  validate:
+    name: Validate Specs
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install SDD Tool
+        run: npm install -g sdd-tool
+
+      - name: Validate specifications
+        run: sdd validate

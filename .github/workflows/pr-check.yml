@@ -1,0 +1,75 @@
+name: PR Check
+
+on:
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  commit-message:
+    name: Commit Message Format
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate commit messages
+        run: |
+          # SDD commit format: <type>(<scope>): <subject>
+          PATTERN='^(spec|spec-update|spec-status|plan|tasks|constitution|sdd-config|feat|fix|docs|style|refactor|test|chore)\(.+\): .+'
+          FAILED=0
+          git log --format='%s' origin/${{ github.base_ref }}..HEAD | while read msg; do
+            if ! echo "$msg" | grep -qE "$PATTERN"; then
+              echo "::error::Invalid commit message: '$msg'"
+              echo "Expected format: <type>(<scope>): <subject>"
+              FAILED=1
+            fi
+          done
+          exit $FAILED
+
+  privacy-check:
+    name: Privacy Compliance
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Check for hardcoded paths or secrets
+        run: |
+          # No absolute home paths should be hardcoded
+          if grep -rn '/Users/\|/home/' --include='*.mjs' --include='*.js' . 2>/dev/null | grep -v node_modules | grep -v '.git/'; then
+            echo "::warning::Hardcoded home directory paths detected. Use dynamic path resolution."
+          fi
+
+          # No API keys or tokens
+          if grep -rn 'sk-\|api_key\|API_KEY\|secret' --include='*.mjs' --include='*.js' . 2>/dev/null | grep -v node_modules | grep -v '.git/'; then
+            echo "::warning::Potential secrets detected. Review flagged lines."
+          fi
+
+  spec-coverage:
+    name: Spec Coverage
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Check spec-to-code alignment
+        run: |
+          echo "=== Spec Coverage Report ==="
+
+          # List all spec files
+          SPEC_COUNT=0
+          if [ -d ".sdd/specs" ]; then
+            SPEC_COUNT=$(find .sdd/specs -name '*.md' | wc -l | tr -d ' ')
+          fi
+          echo "Spec files found: $SPEC_COUNT"
+
+          # List all implementation files
+          IMPL_COUNT=$(find . -name '*.mjs' -not -path './node_modules/*' -not -path './.git/*' | wc -l | tr -d ' ')
+          echo "Implementation files (.mjs): $IMPL_COUNT"
+
+          echo "=== End Report ==="
