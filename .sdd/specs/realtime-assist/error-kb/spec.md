@@ -152,18 +152,18 @@ CREATE VIRTUAL TABLE vec_error_kb USING vec0(
 4. 해결에 사용된 도구명 (`resolved_by`) (SHOULD)
 5. 해결 도구 시퀀스 (`tool_sequence`, JSON 배열) (SHOULD)
 6. ISO 타임스탬프 `ts`, `use_count: 0` (SHALL)
-7. `embedding`은 `NULL`로 기록 — SessionEnd 배치에서 생성 (SHALL)
+7. 임베딩은 기록하지 않음 — SessionEnd 배치에서 `vec_error_kb`에 별도 생성 (SHALL)
 
 ```sql
-INSERT INTO error_kb (ts, error_normalized, error_raw, resolution, resolved_by, tool_sequence, use_count, embedding)
-VALUES (?, ?, ?, ?, ?, ?, 0, NULL)
+INSERT INTO error_kb (ts, error_normalized, error_raw, resolution, resolved_by, tool_sequence, use_count)
+VALUES (?, ?, ?, ?, ?, ?, 0)
 ```
 
 #### Scenario RA-003-1: 정상적인 해결 기록
 
 - **GIVEN** 에러 `"Module not found <STR>"`가 `Edit` 도구 사용 후 해결됨
 - **WHEN** `recordResolution(normalizedError, { errorRaw: "Module not found 'foo'", resolution: "import 경로 수정", resolvedBy: "Edit", toolSequence: ["Read", "Edit"] })`를 호출하면
-- **THEN** `error_kb` 테이블에 해당 필드가 포함된 행이 INSERT되고, `embedding`은 NULL이다
+- **THEN** `error_kb` 테이블에 해당 필드가 포함된 행이 INSERT된다 (임베딩은 SessionEnd 배치에서 `vec_error_kb`에 생성)
 
 #### Scenario RA-003-2: DB가 아직 없을 때
 
@@ -188,7 +188,7 @@ VALUES (?, ?, ?, ?, ?, ?, 0, NULL)
 - `tool_sequence` (TEXT): 해결 도구 시퀀스 JSON 배열 (SHOULD)
 - `use_count` (INTEGER): KB 조회 횟수, 기본값 0 (SHALL)
 - `last_used` (TEXT): 마지막 조회 시각 (SHOULD)
-- `embedding` (BLOB): sqlite-vec float[384] 벡터, 배치 생성 전까지 NULL (SHOULD)
+- 임베딩은 `vec_error_kb` 가상 테이블에 별도 저장 (배치 생성, SHOULD)
 
 #### Scenario RA-004-1: 필수 컬럼 누락 시
 
@@ -202,33 +202,34 @@ VALUES (?, ?, ?, ?, ?, ?, 0, NULL)
 
 시스템은 SessionEnd 시점에 임베딩이 없는 error_kb 엔트리에 대해 벡터 임베딩을 배치 생성해야 한다(SHALL).
 
-1. `embedding IS NULL`인 엔트리를 조회한다 (SHALL)
+1. `vec_error_kb`에 임베딩이 없는 엔트리를 조회한다 (SHALL)
    ```sql
-   SELECT id, error_normalized FROM error_kb WHERE embedding IS NULL
+   SELECT id, error_normalized FROM error_kb WHERE id NOT IN (SELECT error_kb_id FROM vec_error_kb)
    ```
 2. `db.mjs`의 `generateEmbeddings(texts)` 함수를 사용하여 벡터를 생성한다 (SHALL)
-3. 생성된 벡터를 각 엔트리에 업데이트한다 (SHALL)
+3. 생성된 벡터를 `vec_error_kb` 가상 테이블에 삽입한다 (SHALL)
    ```sql
-   UPDATE error_kb SET embedding = ? WHERE id = ?
+   DELETE FROM vec_error_kb WHERE error_kb_id = ?;
+   INSERT INTO vec_error_kb (error_kb_id, embedding) VALUES (?, ?);
    ```
 4. 임베딩 생성 실패 시 해당 엔트리를 건너뛰고 다음 엔트리를 계속 처리해야 한다(SHALL)
 5. 한 번에 최대 50건씩 배치 처리하여 `claude --print` 호출 횟수를 최소화한다(SHOULD)
 
 #### Scenario RA-005-1: 새 엔트리에 임베딩 배치 생성
 
-- **GIVEN** `error_kb`에 `embedding IS NULL`인 엔트리 5건이 존재
+- **GIVEN** `error_kb`에 `vec_error_kb`에 임베딩이 없는 엔트리 5건이 존재
 - **WHEN** SessionEnd에서 `generateErrorEmbeddings()`가 호출되면
-- **THEN** 5건 모두에 float[384] 벡터 임베딩이 생성되어 `embedding` 컬럼에 저장된다
+- **THEN** 5건 모두에 float[384] 벡터 임베딩이 생성되어 `vec_error_kb` 테이블에 저장된다
 
 #### Scenario RA-005-2: 임베딩 생성 부분 실패
 
-- **GIVEN** `error_kb`에 `embedding IS NULL`인 엔트리 3건 중 2번째 엔트리의 임베딩 생성이 실패
+- **GIVEN** `error_kb`에 `vec_error_kb`에 임베딩이 없는 엔트리 3건 중 2번째 엔트리의 임베딩 생성이 실패
 - **WHEN** `generateErrorEmbeddings()`가 호출되면
-- **THEN** 1번째와 3번째 엔트리는 정상적으로 임베딩이 저장되고, 2번째는 `embedding`이 NULL로 유지된다
+- **THEN** 1번째와 3번째 엔트리는 정상적으로 `vec_error_kb`에 임베딩이 저장되고, 2번째는 `vec_error_kb`에 엔트리가 생성되지 않는다
 
 #### Scenario RA-005-3: 임베딩이 없는 엔트리가 없을 때
 
-- **GIVEN** `error_kb`의 모든 엔트리에 `embedding`이 이미 존재
+- **GIVEN** `error_kb`의 모든 엔트리에 대응하는 `vec_error_kb` 임베딩이 이미 존재
 - **WHEN** `generateErrorEmbeddings()`가 호출되면
 - **THEN** 아무 작업 없이 즉시 반환한다
 

@@ -188,7 +188,7 @@ pre-tool-guide는 도구 실행 전에 과거 학습 데이터를 기반으로 �
 
 ### 출력 형식
 
-- stdout 출력은 `{ "hookSpecificOutput": { "additionalContext": "..." } }` JSON 형태 (SHALL)
+- stdout 출력은 `{ "hookSpecificOutput": { "hookEventName": "PreToolUse", "additionalContext": "..." } }` JSON 형태 (SHALL)
 - `additionalContext` 문자열에 여러 가이드 항목을 개행(`\n`)으로 구분 (SHOULD)
 
 ---

@@ -577,13 +577,15 @@ export function vectorSearch(table, vecTable, queryEmbedding, limit = 5) {
 export function readStdin() {
   return new Promise((resolve, reject) => {
     let data = '';
+    const timeout = setTimeout(() => reject(new Error('stdin timeout')), 5000);
     process.stdin.setEncoding('utf-8');
     process.stdin.on('data', chunk => { data += chunk; });
     process.stdin.on('end', () => {
+      clearTimeout(timeout);
       try { resolve(JSON.parse(data)); }
       catch (e) { reject(e); }
     });
-    process.stdin.on('error', reject);
+    process.stdin.on('error', (e) => { clearTimeout(timeout); reject(e); });
   });
 }
 
@@ -1245,15 +1247,16 @@ try {
       WHERE id NOT IN (SELECT error_kb_id FROM vec_error_kb)
     `).all();
     if (newErrors.length > 0) {
-      const { generateEmbeddings } = await import('../lib/db.mjs');
       const texts = newErrors.map(e => e.error_normalized);
       const embeddings = await generateEmbeddings(texts);
 
       // Update embeddings in error_kb table
-      const vecStmt = db.prepare('INSERT OR REPLACE INTO vec_error_kb (error_kb_id, embedding) VALUES (?, ?)');
+      const delStmt = db.prepare('DELETE FROM vec_error_kb WHERE error_kb_id = ?');
+      const vecStmt = db.prepare('INSERT INTO vec_error_kb (error_kb_id, embedding) VALUES (?, ?)');
       newErrors.forEach((err, i) => {
         if (embeddings[i]) {
           const embeddingBlob = Buffer.from(new Float32Array(embeddings[i]).buffer);
+          delStmt.run(err.id);
           vecStmt.run(err.id, embeddingBlob);
         }
       });
@@ -1277,7 +1280,8 @@ try {
       const embeddings = await generateEmbeddings([text]);
       if (embeddings?.[0] && skillId) {
         const embeddingBlob = Buffer.from(new Float32Array(embeddings[0]).buffer);
-        db.prepare('INSERT OR REPLACE INTO vec_skill_embeddings (skill_id, embedding) VALUES (?, ?)').run(skillId, embeddingBlob);
+        db.prepare('DELETE FROM vec_skill_embeddings WHERE skill_id = ?').run(skillId);
+        db.prepare('INSERT INTO vec_skill_embeddings (skill_id, embedding) VALUES (?, ?)').run(skillId, embeddingBlob);
       }
     }
   } catch { /* Skill embedding generation is non-critical */ }
@@ -1895,7 +1899,8 @@ export async function searchErrorKB(normalizedError) {
     // Generate embedding from normalized error text first
     const embeddings = await generateEmbeddings([normalizedError]);
     if (embeddings && embeddings[0]) {
-      const vectorResults = vectorSearch('error_kb', 'vec_error_kb', embeddings[0], 3);
+      const vectorResults = vectorSearch('error_kb', 'vec_error_kb', embeddings[0], 3)
+        .filter(r => r.resolution != null);
       if (vectorResults.length > 0 && vectorResults[0].distance < 0.76) {
         // 사용 카운트 증가
         db.prepare('UPDATE error_kb SET use_count = use_count + 1, last_used = ? WHERE id = ?')
@@ -2044,8 +2049,13 @@ async function init() {
 async function embed(texts) {
   const results = [];
   for (const text of texts) {
+    if (!text || text.trim().length === 0) {
+      results.push(null);
+      continue;
+    }
     const output = await extractor(text, { pooling: 'mean', normalize: true });
-    results.push(Array.from(output.data));
+    const vec = Array.from(output.data);
+    results.push(vec.some(v => !isFinite(v)) ? null : vec);
   }
   return results;
 }
@@ -2275,7 +2285,7 @@ function keywordMatch(prompt, skills) {
       const patternWords = pattern.toLowerCase().split(/\s+/).filter(w => w.length > 2);
       const matchCount = patternWords.filter(w => promptLower.includes(w)).length;
       if (patternWords.length > 0 && matchCount / patternWords.length >= 0.5) {
-        return skill;
+        return { name: skill.name, match: 'keyword', confidence: matchCount / patternWords.length, scope: skill.scope };
       }
     }
   }
@@ -2302,14 +2312,14 @@ function extractPatterns(content) {
 
 ```javascript
 // ~/.self-generation/hooks/prompt-logger.mjs (v6 확장)
-import { insertEvent, getProjectName, readStdin, isEnabled, loadConfig } from '../lib/db.mjs';
+import { insertEvent, getProjectName, readStdin, loadConfig } from '../lib/db.mjs';
 import { loadSkills, matchSkill } from '../lib/skill-matcher.mjs';
 
 try {
   const input = await readStdin();
-  if (!isEnabled()) process.exit(0);
-
   const config = loadConfig();
+  if (config.enabled === false) process.exit(0);
+
   const promptText = config.collectPromptText === false ? '[REDACTED]' : input.prompt;
 
   // 1. 프롬프트 기록 (events 테이블에 INSERT)
@@ -2380,7 +2390,8 @@ try {
     project: getProjectName(input.cwd),
     projectPath: input.cwd,
     agentId: input.agent_id,
-    agentType: input.agent_type
+    agentType: input.agent_type,
+    success: !input.error
   };
 
   insertEvent(entry);
@@ -2540,22 +2551,22 @@ try {
     }
   }
 
-  // 3. Task 도구: 서브에이전트 사용 빈도 안내
+  // 3. Task 도구: 서브에이전트 실패율 경고
   if (input.tool_name === 'Task' && input.tool_input?.subagent_type) {
     const agentType = input.tool_input.subagent_type;
     const db = getDb();
-    const usageCount = db.prepare(`
-      SELECT COUNT(*) AS cnt FROM events
-      WHERE type = 'subagent_stop' AND json_extract(data, '$.agentType') = ?
-    `).get(agentType)?.cnt || 0;
-
-    if (usageCount >= 5) {
-      const avgHist = db.prepare(`
-        SELECT json_extract(data, '$.agentType') AS agent, COUNT(*) AS cnt
-        FROM events WHERE type = 'subagent_stop'
-        GROUP BY agent ORDER BY cnt DESC LIMIT 5
-      `).all();
-      parts.push(`📊 ${agentType} 사용 ${usageCount}회. 최다 사용 에이전트: ${avgHist.map(h => `${h.agent}(${h.cnt})`).join(', ')}`);
+    const stats = db.prepare(`
+      SELECT COUNT(*) AS total,
+        SUM(CASE WHEN json_extract(data, '$.success') = 0 THEN 1 ELSE 0 END) AS failures
+      FROM (
+        SELECT data FROM events
+        WHERE type = 'subagent_stop' AND json_extract(data, '$.agentType') = ?
+        ORDER BY ts DESC LIMIT 20
+      )
+    `).get(agentType);
+    if (stats && stats.total >= 5 && stats.failures / stats.total > 0.3) {
+      parts.push(`📊 ${agentType} 최근 실패율: ${Math.round(stats.failures / stats.total * 100)}% (${stats.total}회 중 ${stats.failures}회)`);
+      parts.push(`   더 높은 티어의 에이전트 사용을 고려하세요.`);
     }
   }
 
