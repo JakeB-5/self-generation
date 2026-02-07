@@ -339,6 +339,7 @@ import * as sqliteVec from 'sqlite-vec';
 import { mkdirSync, existsSync, openSync, readSync, closeSync } from 'fs';
 import { readFileSync } from 'fs';
 import { join } from 'path';
+import { homedir } from 'os';
 import { execSync } from 'child_process';
 
 const GLOBAL_DIR = join(process.env.HOME, '.self-generation');
@@ -490,7 +491,7 @@ export function queryEvents(filters = {}) {
   const limit = filters.limit ? `LIMIT ${Number(filters.limit)}` : '';
 
   const rows = db.prepare(`
-    SELECT * FROM events ${where} ORDER BY ts ASC ${limit}
+    SELECT * FROM events ${where} ORDER BY ts DESC ${limit}
   `).all(...params);
 
   // Reconstruct flat entry format for backward compatibility
@@ -553,7 +554,7 @@ export async function generateEmbeddings(texts) {
  */
 export function vectorSearch(table, embeddingColumn, queryEmbedding, limit = 5) {
   const db = getDb();
-  const embeddingBlob = Buffer.from(new Float32Array(queryEmbedding).buffer);
+  const embeddingBlob = new Float32Array(queryEmbedding);
 
   return db.prepare(`
     SELECT *, vec_distance_cosine(${embeddingColumn}, ?) AS distance
@@ -680,6 +681,7 @@ try {
         tool: input.tool_name,
         sessionId: input.session_id,
         resolvedBy: 'success_after_error',
+        errorRaw: lastError.errorRaw || null,
         // P11: 풍부한 해결 컨텍스트
         filePath: entry.meta?.file || null,
         toolSequence: toolsBetween,
@@ -713,6 +715,7 @@ try {
             tool: pendingError.tool,
             sessionId: input.session_id,
             resolvedBy: 'cross_tool_resolution',
+            errorRaw: pendingError.errorRaw || null,
             helpingTool: input.tool_name,
             filePath: entry.meta?.file || null,
             toolSequence: helpingTools
@@ -1023,8 +1026,9 @@ export function runAnalysis(options = {}) {
   try {
     // claude --print: 비대화형 모드로 실행, JSON 응답만 받음
     const result = execSync(
-      `claude --print "${prompt.replace(/"/g, '\\"')}"`,
+      'claude --print',
       {
+        input: prompt,
         encoding: 'utf-8',
         maxBuffer: 10 * 1024 * 1024
       }
@@ -1131,7 +1135,11 @@ function buildPrompt(logSummary, days, project) {
     feedback ? JSON.stringify(feedback, null, 2) : '피드백 이력 없음 (첫 분석)');
 
   // P3: 기존 스킬 목록 주입 (v7)
-  const skills = loadSkills();
+  // project name → projectPath 조회 (이벤트에서 가장 최근 경로 사용)
+  const projectPath = project
+    ? queryEvents({ project, limit: 1 })[0]?.projectPath || null
+    : null;
+  const skills = loadSkills(projectPath);
   template = template.replace('{{existing_skills}}',
     skills.length > 0 ? skills.map(s => `- ${s.name}: ${s.description || ''}`).join('\n') : '등록된 스킬 없음');
 
@@ -1237,7 +1245,7 @@ try {
       const stmt = db.prepare('UPDATE error_kb SET embedding = ? WHERE id = ?');
       newErrors.forEach((err, i) => {
         if (embeddings[i]) {
-          const embeddingBlob = Buffer.from(new Float32Array(embeddings[i]).buffer);
+          const embeddingBlob = new Float32Array(embeddings[i]);
           stmt.run(embeddingBlob, err.id);
         }
       });
@@ -1705,9 +1713,9 @@ function calcRuleEffectiveness() {
 /**
  * 장기 미사용 스킬 탐지 (P5: v7)
  */
-function findStaleSkills(days) {
+function findStaleSkills(days, projectPath = null) {
   try {
-    const skills = loadSkills();
+    const skills = loadSkills(projectPath);
     const db = getDb();
     const threshold = new Date(Date.now() - days * 86400000).toISOString();
     return skills
@@ -1830,6 +1838,20 @@ AI 분석 실행 시 `getFeedbackSummary()`의 결과를 프롬프트에 추가�
 import { getDb, vectorSearch, generateEmbeddings } from './db.mjs';
 
 /**
+ * 에러 메시지 정규화 (단일 소유자: error-kb.mjs)
+ * 경로, 숫자, 문자열 리터럴을 플레이스홀더로 치환하여 동일 패턴 에러를 그룹화
+ */
+export function normalizeError(error) {
+  return error
+    .replace(/\/[\w/.\-@]+/g, '<PATH>')
+    .replace(/\d{2,}/g, '<N>')
+    .replace(/'[^']{0,100}'/g, '<STR>')
+    .replace(/"[^"]{0,100}"/g, '<STR>')
+    .slice(0, 200)
+    .trim();
+}
+
+/**
  * 에러 해결 이력 검색 (벡터 유사도 + 텍스트 폴백)
  * 정규화된 에러 메시지로 과거 해결 사례를 조회
  */
@@ -1906,7 +1928,7 @@ export function recordResolution(normalizedError, resolution) {
 ```javascript
 // ~/.self-generation/hooks/error-logger.mjs (v6 확장)
 import { insertEvent, getProjectName, readStdin } from '../lib/db.mjs';
-import { searchErrorKB } from '../lib/error-kb.mjs';
+import { normalizeError, searchErrorKB } from '../lib/error-kb.mjs';
 
 try {
   const input = readStdin();
@@ -1928,13 +1950,13 @@ try {
   insertEvent(entry);
 
   // 2. 에러 KB 실시간 검색 (v6 추가)
-  const kbMatch = searchErrorKB(normalized);
+  const kbMatch = await searchErrorKB(normalized);
   if (kbMatch) {
     const output = {
       hookSpecificOutput: {
         hookEventName: 'PostToolUseFailure',
         additionalContext: `[Self-Generation 에러 KB] 이전에 동일 에러를 해결한 이력이 있습니다:\n` +
-          `- 에러: ${kbMatch.error}\n` +
+          `- 에러: ${kbMatch.error_normalized}\n` +
           `- 해결 방법: ${kbMatch.resolution}\n` +
           `이 정보를 참고하여 해결을 시도하세요.`
       }
@@ -1946,16 +1968,7 @@ try {
 } catch (e) {
   process.exit(0);
 }
-
-function normalizeError(error) {
-  return error
-    .replace(/\/[\w/.\-@]+/g, '<PATH>')
-    .replace(/\d{2,}/g, '<N>')
-    .replace(/'[^']{0,100}'/g, '<STR>')
-    .replace(/"[^"]{0,100}"/g, '<STR>')
-    .slice(0, 200)
-    .trim();
-}
+// normalizeError()는 error-kb.mjs에서 import (단일 소유자 원칙)
 ```
 
 ### 8.2 스킬 자동 감지
@@ -1966,7 +1979,7 @@ function normalizeError(error) {
 // ~/.self-generation/lib/skill-matcher.mjs
 import { readdirSync, readFileSync, existsSync } from 'fs';
 import { join } from 'path';
-import { getDb, vectorSearch } from './db.mjs';
+import { getDb, vectorSearch, generateEmbeddings } from './db.mjs';
 
 /**
  * 기존 스킬 목록 로드 (전역 + 프로젝트)
@@ -2098,7 +2111,7 @@ try {
   // 2. 스킬 자동 감지 (v6 추가)
   const skills = loadSkills(input.cwd);
   if (skills.length > 0) {
-    const matched = matchSkill(input.prompt, skills);
+    const matched = await matchSkill(input.prompt, skills);
     if (matched) {
       const output = {
         hookSpecificOutput: {
@@ -2121,7 +2134,7 @@ try {
       ts: new Date().toISOString(),
       sessionId: input.session_id,
       project: getProjectName(input.cwd),
-      project_path: input.cwd,
+      projectPath: input.cwd,
       skillName
     });
   }
@@ -2268,7 +2281,7 @@ try {
 
     if (fileErrors.length > 0) {
       const errorData = JSON.parse(fileErrors[0].data);
-      const kbResult = searchErrorKB(errorData.error);
+      const kbResult = await searchErrorKB(errorData.error);
       if (kbResult) {
         parts.push(`⚠️ 이 파일 관련 과거 에러 이력: ${kbResult.error_normalized}`);
         parts.push(`   해결 방법: ${kbResult.resolution}`);
@@ -2284,7 +2297,7 @@ try {
     }).filter(e => e.tool === 'Bash');
 
     if (cmdErrors.length > 0) {
-      const kbResult = searchErrorKB(cmdErrors[cmdErrors.length - 1].error);
+      const kbResult = await searchErrorKB(cmdErrors[cmdErrors.length - 1].error);
       if (kbResult) {
         parts.push(`💡 이 세션에서 Bash 에러 발생 이력: ${kbResult.error_normalized}`);
         const resolution = typeof kbResult.resolution === 'string'
@@ -2317,7 +2330,7 @@ try {
 
   if (parts.length > 0) {
     process.stdout.write(JSON.stringify({
-      hookSpecificOutput: { additionalContext: parts.join('\n') }
+      hookSpecificOutput: { hookEventName: 'PreToolUse', additionalContext: parts.join('\n') }
     }));
   }
   process.exit(0);
@@ -2358,7 +2371,7 @@ try {
     parts.push('이 프로젝트의 최근 에러 패턴:');
     for (const err of projectErrors) {
       parts.push(`- ${err.error} (${err.tool})`);
-      const kb = searchErrorKB(err.error);
+      const kb = await searchErrorKB(err.error);
       if (kb?.resolution) {
         parts.push(`  해결: ${JSON.stringify(kb.resolution).slice(0, 150)}`);
       }
@@ -2381,7 +2394,7 @@ try {
     // 최대 500자로 제한
     const context = parts.join('\n').slice(0, 500);
     process.stdout.write(JSON.stringify({
-      hookSpecificOutput: { additionalContext: context }
+      hookSpecificOutput: { hookEventName: 'SubagentStart', additionalContext: context }
     }));
   }
   process.exit(0);

@@ -38,7 +38,7 @@ CREATE TABLE skill_embeddings (
 
 ### 매칭 우선순위
 
-1. 벡터 유사도 검색 (cosine distance < 0.3)
+1. 벡터 유사도 검색 (cosine distance < 0.76)
 2. 키워드 패턴 매칭 (50% 이상 임계값, fallback)
 
 ---
