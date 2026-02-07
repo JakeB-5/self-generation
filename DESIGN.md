@@ -65,8 +65,12 @@ Claude Code를 사용하면서 사용자는 무의식적으로 동일한 패턴�
 | 설정 | JSON | Claude Code settings.json과 동일 패턴 |
 
 > **의존성 정책 변경**: 초기 설계의 "외부 npm 패키지 제로" 정책에서 "최소 의존성" 정책으로 전환.
-> `better-sqlite3`와 `sqlite-vec` 2개 패키지만 사용하며, JSONL 대비 인덱스 기반 쿼리 성능,
-> WAL 모드 동시성, 벡터 유사도 검색 등의 이점이 의존성 추가를 정당화한다.
+> `better-sqlite3`, `sqlite-vec`, `@xenova/transformers` 3개 패키지를 사용하며, 인덱스 기반 쿼리 성능,
+> WAL 모드 동시성, 벡터 유사도 검색, 오프라인 임베딩 등의 이점이 의존성 추가를 정당화한다.
+
+> **시스템 요구사항**: `better-sqlite3`는 네이티브 C++ 애드온으로 빌드 도구가 필요하다.
+> macOS: Xcode Command Line Tools (`xcode-select --install`), Linux: `build-essential` 패키지.
+> `@xenova/transformers`는 첫 실행 시 ONNX 모델을 ~120MB 다운로드한다 (이후 로컬 캐시).
 
 ---
 
@@ -219,7 +223,8 @@ Claude Code를 사용하면서 사용자는 무의식적으로 동일한 패턴�
 │   ├── skill-matcher.mjs          ← 벡터 기반 스킬-프롬프트 매칭
 │   ├── embedding-server.mjs       ← 임베딩 데몬 (Transformers.js 상주 프로세스)
 │   ├── embedding-client.mjs       ← 임베딩 클라이언트 (훅용 소켓 통신)
-│   └── feedback-tracker.mjs       ← 피드백 추적
+│   ├── feedback-tracker.mjs       ← 피드백 추적
+│   └── batch-embeddings.mjs       ← Detached 배치 임베딩 프로세서
 ├── prompts/
 │   └── analyze.md                 ← AI 분석 프롬프트 템플릿
 └── bin/
@@ -311,7 +316,7 @@ Claude Code를 사용하면서 사용자는 무의식적으로 동일한 패턴�
 ```
 
 **설계 원칙:**
-- 모든 수집 훅은 **non-blocking** (exit code 0, 빠른 완료, 임베딩은 데몬 소켓 통신으로 ~5ms)
+- 모든 수집 훅은 **non-blocking** (exit code 0, 빠른 완료, 임베딩은 데몬 소켓 통신으로 ~5ms, 배치 임베딩은 detached 프로세스로 분리)
 - 훅 실패가 Claude Code 세션에 영향을 주지 않음
 
 #### API 필드 검증 결과
@@ -366,10 +371,20 @@ export function getDb() {
   _db.pragma('journal_mode = WAL');
   _db.pragma('busy_timeout = 5000');
 
-  // sqlite-vec 확장 로드
+  // sqlite-vec 확장 로드 (벡터 검색이 필요한 훅에서만 로드하면 이상적이나,
+  // 어떤 훅이 벡터 검색을 사용할지 사전에 알 수 없으므로 일괄 로드)
   sqliteVec.load(_db);
 
-  initDb(_db);
+  // Skip DDL if tables already exist (saves ~5-10ms per hook invocation)
+  // Check both regular tables and vec0 virtual tables
+  const eventsExists = _db.prepare(
+    "SELECT name FROM sqlite_master WHERE type='table' AND name='events'"
+  ).get();
+  const vecExists = _db.prepare(
+    "SELECT name FROM sqlite_master WHERE type='table' AND name='vec_error_kb'"
+  ).get();
+  if (!eventsExists || !vecExists) initDb(_db);
+
   return _db;
 }
 
@@ -436,22 +451,34 @@ export function initDb(db) {
       keywords TEXT,
       updated_at TEXT NOT NULL
     );
-
-    -- Vector search virtual tables (sqlite-vec)
-    CREATE VIRTUAL TABLE IF NOT EXISTS vec_error_kb USING vec0(
-      error_kb_id INTEGER PRIMARY KEY,
-      embedding float[384]
-    );
-    CREATE VIRTUAL TABLE IF NOT EXISTS vec_skill_embeddings USING vec0(
-      skill_id INTEGER PRIMARY KEY,
-      embedding float[384]
-    );
   `);
+
+  // vec0 virtual tables — wrapped in individual try-catch
+  // because IF NOT EXISTS behavior may vary across sqlite-vec versions
+  try {
+    db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS vec_error_kb USING vec0(
+      error_kb_id INTEGER PRIMARY KEY, embedding float[384]
+    )`);
+  } catch { /* Table already exists or vec0 unavailable */ }
+
+  try {
+    db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS vec_skill_embeddings USING vec0(
+      skill_id INTEGER PRIMARY KEY, embedding float[384]
+    )`);
+  } catch { /* Table already exists or vec0 unavailable */ }
 }
 
 export function getProjectName(cwd) {
   // /Users/sungwon/projects/my-app → my-app (표시용)
   return cwd ? cwd.split('/').filter(Boolean).pop() : 'unknown';
+}
+
+/**
+ * 프로젝트 루트 경로 (정규 식별자)
+ * CLAUDE_PROJECT_DIR 환경변수를 우선 사용 (cwd가 서브디렉토리일 수 있음)
+ */
+export function getProjectPath(cwd) {
+  return process.env.CLAUDE_PROJECT_DIR || cwd;
 }
 
 // 주의: project(디렉토리명)는 표시용, project_path(전체 경로)가 정규 식별자
@@ -543,29 +570,48 @@ export async function generateEmbeddings(texts) {
 }
 
 /**
- * 벡터 유사도 검색
- * sqlite-vec의 vec0 가상 테이블에서 KNN 검색 후 원본 테이블과 JOIN
+ * 벡터 유사도 검색 (2단계 쿼리)
+ * Step 1: vec0 가상 테이블에서 KNN 검색으로 ID + distance 수집
+ * Step 2: 원본 테이블에서 ID로 상세 데이터 조회
+ * Note: vec0 MATCH와 직접 JOIN은 sqlite-vec 버전에 따라 미지원될 수 있어 2단계로 분리
  */
 export function vectorSearch(table, vecTable, queryEmbedding, limit = 5) {
   const db = getDb();
   const embeddingBlob = Buffer.from(new Float32Array(queryEmbedding).buffer);
 
   if (table === 'error_kb') {
-    return db.prepare(`
-      SELECT e.*, v.distance
-      FROM vec_error_kb v
-      INNER JOIN error_kb e ON e.id = v.error_kb_id
-      WHERE v.embedding MATCH ? AND k = ?
-      ORDER BY v.distance
+    // Step 1: KNN search on vec0
+    const vecResults = db.prepare(`
+      SELECT error_kb_id, distance FROM vec_error_kb
+      WHERE embedding MATCH ? AND k = ?
+      ORDER BY distance
     `).all(embeddingBlob, limit);
+    if (vecResults.length === 0) return [];
+
+    // Step 2: Fetch full records by IDs
+    const ids = vecResults.map(r => r.error_kb_id);
+    const placeholders = ids.map(() => '?').join(',');
+    const rows = db.prepare(`SELECT * FROM error_kb WHERE id IN (${placeholders})`).all(...ids);
+
+    // Merge distance and preserve order
+    const distMap = Object.fromEntries(vecResults.map(r => [r.error_kb_id, r.distance]));
+    return rows.map(r => ({ ...r, distance: distMap[r.id] }))
+      .sort((a, b) => a.distance - b.distance);
   } else if (table === 'skill_embeddings') {
-    return db.prepare(`
-      SELECT s.*, v.distance
-      FROM vec_skill_embeddings v
-      INNER JOIN skill_embeddings s ON s.id = v.skill_id
-      WHERE v.embedding MATCH ? AND k = ?
-      ORDER BY v.distance
+    const vecResults = db.prepare(`
+      SELECT skill_id, distance FROM vec_skill_embeddings
+      WHERE embedding MATCH ? AND k = ?
+      ORDER BY distance
     `).all(embeddingBlob, limit);
+    if (vecResults.length === 0) return [];
+
+    const ids = vecResults.map(r => r.skill_id);
+    const placeholders = ids.map(() => '?').join(',');
+    const rows = db.prepare(`SELECT * FROM skill_embeddings WHERE id IN (${placeholders})`).all(...ids);
+
+    const distMap = Object.fromEntries(vecResults.map(r => [r.skill_id, r.distance]));
+    return rows.map(r => ({ ...r, distance: distMap[r.id] }))
+      .sort((a, b) => a.distance - b.distance);
   }
   return [];
 }
@@ -631,7 +677,7 @@ export function pruneOldEvents(retentionDays) {
 
 ```javascript
 // ~/.self-generation/hooks/prompt-logger.mjs
-import { insertEvent, getProjectName, readStdin } from '../lib/db.mjs';
+import { insertEvent, getProjectName, getProjectPath, readStdin } from '../lib/db.mjs';
 
 try {
   const input = await readStdin();
@@ -641,8 +687,8 @@ try {
     type: 'prompt',
     ts: new Date().toISOString(),
     sessionId: input.session_id,
-    project: getProjectName(input.cwd),
-    projectPath: input.cwd,
+    project: getProjectName(getProjectPath(input.cwd)),
+    projectPath: getProjectPath(input.cwd),
     text: input.prompt,
     charCount: input.prompt.length
   };
@@ -664,7 +710,7 @@ try {
 
 ```javascript
 // ~/.self-generation/hooks/tool-logger.mjs
-import { insertEvent, queryEvents, getProjectName, readStdin, isEnabled } from '../lib/db.mjs';
+import { insertEvent, queryEvents, getProjectName, getProjectPath, readStdin, isEnabled } from '../lib/db.mjs';
 import { recordResolution } from '../lib/error-kb.mjs';
 
 try {
@@ -676,8 +722,8 @@ try {
     type: 'tool_use',
     ts: new Date().toISOString(),
     sessionId: input.session_id,
-    project: getProjectName(input.cwd),
-    projectPath: input.cwd,
+    project: getProjectName(getProjectPath(input.cwd)),
+    projectPath: getProjectPath(input.cwd),
     tool: input.tool_name,
     meta: extractToolMeta(input.tool_name, input.tool_input),
     success: true
@@ -686,8 +732,9 @@ try {
   insertEvent(entry);
 
   // Resolution detection (v7 개선: 세션스코프 + 풍부한 컨텍스트 + 크로스도구)
+  // Performance: limit to recent 50 events to avoid O(n²) on long sessions
   try {
-    const sessionEntries = queryEvents({ sessionId: input.session_id })
+    const sessionEntries = queryEvents({ sessionId: input.session_id, limit: 50 })
       .sort((a, b) => new Date(a.ts) - new Date(b.ts)); // 시간순
 
     // 1. 동일 도구 해결 감지 (P4: 세션스코프, 5분 제한 제거)
@@ -803,7 +850,7 @@ function extractToolMeta(tool, toolInput) {
 
 ```javascript
 // ~/.self-generation/hooks/session-summary.mjs (기본 버전, Phase 1용)
-import { insertEvent, queryEvents, getProjectName, readStdin } from '../lib/db.mjs';
+import { insertEvent, queryEvents, getProjectName, getProjectPath, readStdin } from '../lib/db.mjs';
 
 try {
   const input = await readStdin();
@@ -827,8 +874,8 @@ try {
     type: 'session_summary',
     ts: new Date().toISOString(),
     sessionId: input.session_id,
-    project: getProjectName(input.cwd),
-    projectPath: input.cwd,
+    project: getProjectName(getProjectPath(input.cwd)),
+    projectPath: getProjectPath(input.cwd),
     promptCount: prompts.length,
     toolCounts,
     toolSequence,
@@ -1177,8 +1224,9 @@ function extractJSON(text) {
 
 ```javascript
 // ~/.self-generation/hooks/session-summary.mjs
-import { insertEvent, queryEvents, getProjectName, getDb, readStdin, generateEmbeddings, isEnabled } from '../lib/db.mjs';
+import { insertEvent, queryEvents, getProjectName, getProjectPath, getDb, readStdin, generateEmbeddings, isEnabled } from '../lib/db.mjs';
 import { runAnalysisAsync } from '../lib/ai-analyzer.mjs';
+import { join } from 'path';
 
 try {
   const input = await readStdin();
@@ -1206,8 +1254,8 @@ try {
     type: 'session_summary',
     ts: new Date().toISOString(),
     sessionId: input.session_id,
-    project: getProjectName(input.cwd),
-    projectPath: input.cwd,
+    project: getProjectName(getProjectPath(input.cwd)),
+    projectPath: getProjectPath(input.cwd),
     promptCount: prompts.length,
     toolCounts,
     toolSequence,
@@ -1229,66 +1277,95 @@ try {
   // AI 분석을 백그라운드로 트리거 (세션 종료를 블로킹하지 않음)
   // P8: reason='clear'이거나 프롬프트 3개 미만이면 분석 생략 (v7)
   if (!skipAnalysis && prompts.length >= 3) {
-    runAnalysisAsync({ days: 7, project: getProjectName(input.cwd), projectPath: input.cwd });
+    runAnalysisAsync({ days: 7, project: getProjectName(getProjectPath(input.cwd)), projectPath: getProjectPath(input.cwd) });
   }
 
-  // v8: 임베딩 미생성 에러 KB 엔트리에 대한 배치 임베딩 트리거
+  // v8: 배치 임베딩 처리를 detached 프로세스로 분리 (SessionEnd 블로킹 방지)
+  // 에러 KB + 스킬 임베딩 갱신을 비동기 백그라운드에서 수행
   try {
-    // Ensure embedding daemon is running (may have timed out during long sessions)
-    const { isServerRunning, startServer } = await import('../lib/embedding-client.mjs');
-    if (!await isServerRunning()) {
-      await startServer();
-      await new Promise(r => setTimeout(r, 5000)); // Wait for model load
-    }
-
-    const db = getDb();
-    const newErrors = db.prepare(`
-      SELECT id, error_normalized FROM error_kb
-      WHERE id NOT IN (SELECT error_kb_id FROM vec_error_kb)
-    `).all();
-    if (newErrors.length > 0) {
-      const texts = newErrors.map(e => e.error_normalized);
-      const embeddings = await generateEmbeddings(texts);
-
-      // Update embeddings in error_kb table
-      const delStmt = db.prepare('DELETE FROM vec_error_kb WHERE error_kb_id = ?');
-      const vecStmt = db.prepare('INSERT INTO vec_error_kb (error_kb_id, embedding) VALUES (?, ?)');
-      newErrors.forEach((err, i) => {
-        if (embeddings[i]) {
-          const embeddingBlob = Buffer.from(new Float32Array(embeddings[i]).buffer);
-          delStmt.run(err.id);
-          vecStmt.run(err.id, embeddingBlob);
-        }
-      });
-    }
-  } catch { /* Embedding generation failure is non-critical */ }
-
-  // v8: 스킬 임베딩 갱신
-  try {
-    const { loadSkills, extractPatterns } = await import('../lib/skill-matcher.mjs');
-    const skills = loadSkills(input.cwd);
-    const db = getDb();
-
-    for (const skill of skills) {
-      const text = skill.content.slice(0, 500);
-      const info = db.prepare(`
-        INSERT OR REPLACE INTO skill_embeddings (name, source_path, description, keywords, updated_at)
-        VALUES (?, ?, ?, ?, ?)
-      `).run(skill.name, skill.sourcePath, skill.description || null, JSON.stringify(extractPatterns(skill.content)), new Date().toISOString());
-      const skillId = info.lastInsertRowid || db.prepare('SELECT id FROM skill_embeddings WHERE name = ?').get(skill.name)?.id;
-
-      const embeddings = await generateEmbeddings([text]);
-      if (embeddings?.[0] && skillId) {
-        const embeddingBlob = Buffer.from(new Float32Array(embeddings[0]).buffer);
-        db.prepare('DELETE FROM vec_skill_embeddings WHERE skill_id = ?').run(skillId);
-        db.prepare('INSERT INTO vec_skill_embeddings (skill_id, embedding) VALUES (?, ?)').run(skillId, embeddingBlob);
-      }
-    }
-  } catch { /* Skill embedding generation is non-critical */ }
+    const { spawn } = await import('child_process');
+    const batchScript = join(process.env.HOME, '.self-generation', 'lib', 'batch-embeddings.mjs');
+    const child = spawn('node', [batchScript, getProjectPath(input.cwd)], {
+      detached: true,
+      stdio: 'ignore'
+    });
+    child.unref();
+  } catch { /* Batch embedding trigger is non-critical */ }
 
   process.exit(0);
 } catch (e) {
   process.exit(0);
+}
+```
+
+#### 5.4.1 배치 임베딩 스크립트 (batch-embeddings.mjs)
+
+SessionEnd에서 detached로 실행되는 배치 임베딩 처리 스크립트. 에러 KB와 스킬 임베딩을 갱신한다.
+
+```javascript
+// ~/.self-generation/lib/batch-embeddings.mjs
+import { getDb, generateEmbeddings } from './db.mjs';
+import { loadSkills, extractPatterns } from './skill-matcher.mjs';
+import { isServerRunning, startServer } from './embedding-client.mjs';
+
+const projectPath = process.argv[2] || process.cwd();
+
+try {
+  // Delay 10s to avoid DB write contention with session-summary and analyze processes
+  await new Promise(r => setTimeout(r, 10000));
+
+  // Ensure embedding daemon is running
+  if (!await isServerRunning()) {
+    await startServer();
+    for (let i = 0; i < 15; i++) {
+      await new Promise(r => setTimeout(r, 1000));
+      if (await isServerRunning()) break;
+    }
+  }
+
+  const db = getDb();
+  db.pragma('busy_timeout = 10000'); // Extended for concurrent writes
+
+  // 1. 에러 KB 배치 임베딩
+  const newErrors = db.prepare(`
+    SELECT id, error_normalized FROM error_kb
+    WHERE id NOT IN (SELECT error_kb_id FROM vec_error_kb)
+  `).all();
+  if (newErrors.length > 0) {
+    const texts = newErrors.map(e => e.error_normalized);
+    const embeddings = await generateEmbeddings(texts);
+    const delStmt = db.prepare('DELETE FROM vec_error_kb WHERE error_kb_id = ?');
+    const vecStmt = db.prepare('INSERT INTO vec_error_kb (error_kb_id, embedding) VALUES (?, ?)');
+    newErrors.forEach((err, i) => {
+      if (embeddings[i]) {
+        const embeddingBlob = Buffer.from(new Float32Array(embeddings[i]).buffer);
+        delStmt.run(err.id);
+        vecStmt.run(err.id, embeddingBlob);
+      }
+    });
+  }
+
+  // 2. 스킬 임베딩 갱신
+  const skills = loadSkills(projectPath);
+  for (const skill of skills) {
+    const text = skill.content.slice(0, 500);
+    const info = db.prepare(`
+      INSERT OR REPLACE INTO skill_embeddings (name, source_path, description, keywords, updated_at)
+      VALUES (?, ?, ?, ?, ?)
+    `).run(skill.name, skill.sourcePath, skill.description || null, JSON.stringify(extractPatterns(skill.content)), new Date().toISOString());
+    const skillId = info.lastInsertRowid || db.prepare('SELECT id FROM skill_embeddings WHERE name = ?').get(skill.name)?.id;
+
+    const embeddings = await generateEmbeddings([text]);
+    if (embeddings?.[0] && skillId) {
+      const embeddingBlob = Buffer.from(new Float32Array(embeddings[0]).buffer);
+      db.prepare('DELETE FROM vec_skill_embeddings WHERE skill_id = ?').run(skillId);
+      db.prepare('INSERT INTO vec_skill_embeddings (skill_id, embedding) VALUES (?, ?)').run(skillId, embeddingBlob);
+    }
+  }
+
+  process.exit(0);
+} catch {
+  process.exit(0); // Non-critical batch process
 }
 ```
 
@@ -1964,7 +2041,7 @@ export function recordResolution(normalizedError, resolution) {
 
 ```javascript
 // ~/.self-generation/hooks/error-logger.mjs (v6 확장)
-import { insertEvent, getProjectName, readStdin, isEnabled } from '../lib/db.mjs';
+import { insertEvent, getProjectName, getProjectPath, readStdin, isEnabled } from '../lib/db.mjs';
 import { normalizeError, searchErrorKB } from '../lib/error-kb.mjs';
 
 try {
@@ -1979,8 +2056,8 @@ try {
     type: 'tool_error',
     ts: new Date().toISOString(),
     sessionId: input.session_id,
-    project: getProjectName(input.cwd),
-    projectPath: input.cwd,
+    project: getProjectName(getProjectPath(input.cwd)),
+    projectPath: getProjectPath(input.cwd),
     tool: input.tool_name,
     error: normalized,
     errorRaw: (input.error || '').slice(0, 500)
@@ -1988,7 +2065,11 @@ try {
   insertEvent(entry);
 
   // 2. 에러 KB 실시간 검색 (v6 추가)
-  const kbMatch = await searchErrorKB(normalized);
+  // 2s timeout to prevent blocking Claude on sync hook (daemon cold start = 10s)
+  const kbMatch = await Promise.race([
+    searchErrorKB(normalized),
+    new Promise(resolve => setTimeout(() => resolve(null), 2000))
+  ]);
   if (kbMatch) {
     const output = {
       hookSpecificOutput: {
@@ -2111,6 +2192,15 @@ server.listen(SOCKET_PATH, () => {
   resetIdleTimer();
 });
 
+// Handle port/socket already in use (another server instance running)
+server.on('error', (e) => {
+  if (e.code === 'EADDRINUSE') {
+    console.error('[embedding-server] Socket already in use, another instance running. Exiting.');
+    process.exit(0);
+  }
+  throw e;
+});
+
 // Graceful shutdown
 process.on('SIGTERM', () => { server.close(); process.exit(0); });
 process.on('SIGINT', () => { server.close(); process.exit(0); });
@@ -2129,10 +2219,23 @@ const TIMEOUT_MS = 10000;
 
 /**
  * 임베딩 데몬에 벡터 생성 요청
- * @param {string[]} texts - 임베딩할 텍스트 배열
- * @returns {number[][]} - 384차원 벡터 배열
+ * 소켓 연결 실패 시 데몬 자동 시작 후 1회 재시도
  */
-export function embedViaServer(texts) {
+export async function embedViaServer(texts) {
+  try {
+    return await _sendRequest(texts);
+  } catch (e) {
+    // Connection failed — auto-start daemon and retry once
+    if (e.code === 'ECONNREFUSED' || e.code === 'ENOENT') {
+      await startServer();
+      await new Promise(r => setTimeout(r, 5000)); // Wait for model load
+      return await _sendRequest(texts);
+    }
+    throw e;
+  }
+}
+
+function _sendRequest(texts) {
   return new Promise((resolve, reject) => {
     const conn = createConnection(SOCKET_PATH);
     const timer = setTimeout(() => {
@@ -2293,7 +2396,7 @@ function keywordMatch(prompt, skills) {
   return null;
 }
 
-function extractPatterns(content) {
+export function extractPatterns(content) {
   const patterns = [];
   const lines = content.split('\n');
   let inSection = false;
@@ -2312,7 +2415,7 @@ function extractPatterns(content) {
 
 ```javascript
 // ~/.self-generation/hooks/prompt-logger.mjs (v6 확장)
-import { insertEvent, getProjectName, readStdin, loadConfig } from '../lib/db.mjs';
+import { insertEvent, getProjectName, getProjectPath, readStdin, loadConfig } from '../lib/db.mjs';
 import { loadSkills, matchSkill } from '../lib/skill-matcher.mjs';
 
 try {
@@ -2328,14 +2431,16 @@ try {
     type: 'prompt',
     ts: new Date().toISOString(),
     sessionId: input.session_id,
-    project: getProjectName(input.cwd),
-    projectPath: input.cwd,
+    project: getProjectName(getProjectPath(input.cwd)),
+    projectPath: getProjectPath(input.cwd),
     text: promptText,
     charCount: promptText.length
   };
   insertEvent(entry);
 
   // 2. 스킬 자동 감지 (v6 추가)
+  // Note: matchSkill()은 벡터 매칭 시 임베딩 데몬 통신(~5ms warm, ~10s cold)이 필요하므로
+  // insertEvent() 완료 후 best-effort로 시도. 데몬 미실행 시 키워드 폴백이 즉시 동작.
   const skills = loadSkills(input.cwd);
   if (skills.length > 0) {
     const matched = await matchSkill(input.prompt, skills);
@@ -2353,17 +2458,21 @@ try {
   }
 
   // P5: 스킬 사용 이벤트 기록 (v7)
+  // Validate against actual skill names to avoid false positives (e.g., "/usr/bin/..." paths)
   if (input.prompt && input.prompt.startsWith('/')) {
     const skillName = input.prompt.split(/\s+/)[0].slice(1); // "/ts-init args" → "ts-init"
-    insertEvent({
-      v: 1,
-      type: 'skill_used',
-      ts: new Date().toISOString(),
-      sessionId: input.session_id,
-      project: getProjectName(input.cwd),
-      projectPath: input.cwd,
-      skillName
-    });
+    const isActualSkill = skills.some(s => s.name === skillName);
+    if (isActualSkill) {
+      insertEvent({
+        v: 1,
+        type: 'skill_used',
+        ts: new Date().toISOString(),
+        sessionId: input.session_id,
+        project: getProjectName(getProjectPath(input.cwd)),
+        projectPath: getProjectPath(input.cwd),
+        skillName
+      });
+    }
   }
 
   process.exit(0);
@@ -2376,7 +2485,7 @@ try {
 
 ```javascript
 // ~/.self-generation/hooks/subagent-tracker.mjs
-import { insertEvent, getProjectName, readStdin, isEnabled } from '../lib/db.mjs';
+import { insertEvent, getProjectName, getProjectPath, readStdin, isEnabled } from '../lib/db.mjs';
 
 try {
   const input = await readStdin();
@@ -2387,11 +2496,14 @@ try {
     type: 'subagent_stop',
     ts: new Date().toISOString(),
     sessionId: input.session_id,
-    project: getProjectName(input.cwd),
-    projectPath: input.cwd,
+    project: getProjectName(getProjectPath(input.cwd)),
+    projectPath: getProjectPath(input.cwd),
     agentId: input.agent_id,
     agentType: input.agent_type,
-    success: !input.error
+    // Note: SubagentStop 공식 stdin 필드는 agent_id, agent_type, agent_transcript_path만 명시.
+    // error 필드는 공식 문서에 없어 항상 undefined일 가능성이 높음 → success 항상 true.
+    // 정확한 실패 판정이 필요하면 agent_transcript_path를 읽어 파싱하는 방안을 고려.
+    success: input.error != null ? false : true
   };
 
   insertEvent(entry);
@@ -2409,13 +2521,14 @@ SessionStart에서 이전 세션의 핵심 정보를 주입하여 세션 연속�
 
 ```javascript
 // ~/.self-generation/hooks/session-analyzer.mjs (v6 확장)
-import { queryEvents, getProjectName, readStdin, isEnabled } from '../lib/db.mjs';
+import { queryEvents, getProjectName, getProjectPath, readStdin, isEnabled } from '../lib/db.mjs';
 import { getCachedAnalysis } from '../lib/ai-analyzer.mjs';
 
 try {
   const input = await readStdin();
   if (!isEnabled()) process.exit(0);
-  const project = getProjectName(input.cwd);
+  const projectDir = getProjectPath(input.cwd);
+  const project = getProjectName(projectDir);
 
   // P7: 세션 소스에 따른 컨텍스트 분기 (v7)
   const isResume = input.source === 'resume';
@@ -2436,7 +2549,7 @@ try {
   }
 
   // 2. 이전 세션 컨텍스트 주입 (v6 추가, SQL 인덱스 기반 조회)
-  const recentSummaries = queryEvents({ type: 'session_summary', projectPath: input.cwd, limit: 1 });
+  const recentSummaries = queryEvents({ type: 'session_summary', projectPath: projectDir, limit: 1 });
 
   if (recentSummaries.length > 0) {
     const prev = recentSummaries[0];
@@ -2497,7 +2610,6 @@ try {
 
 ```javascript
 // ~/.self-generation/hooks/pre-tool-guide.mjs
-import { searchErrorKB } from '../lib/error-kb.mjs';
 import { queryEvents, getDb, readStdin, isEnabled } from '../lib/db.mjs';
 
 try {
@@ -2505,48 +2617,54 @@ try {
   if (!isEnabled()) process.exit(0);
   const parts = [];
 
-  // 1. Edit/Write 도구: 대상 파일 관련 과거 에러 검색
+  // 1. Edit/Write 도구: 대상 파일 관련 과거 에러 + 해결 이력 검색
+  // Note: PreToolUse는 동기 블로킹 훅이므로 벡터 검색 대신 텍스트 매칭만 사용 (성능 우선)
   if (['Edit', 'Write'].includes(input.tool_name) && input.tool_input?.file_path) {
     const filePath = input.tool_input.file_path;
     const fileName = filePath.split('/').pop();
     const db = getDb();
-    // SQL LIKE 검색으로 파일명 관련 에러 조회
-    const fileErrors = db.prepare(`
-      SELECT * FROM events
-      WHERE type = 'tool_error' AND json_extract(data, '$.errorRaw') LIKE ?
-      ORDER BY ts DESC LIMIT 3
+
+    // error_kb에서 파일명 관련 해결 이력 직접 조회 (벡터 검색 불필요)
+    const kbResults = db.prepare(`
+      SELECT error_normalized, resolution FROM error_kb
+      WHERE error_normalized LIKE ? AND resolution IS NOT NULL
+      ORDER BY last_used DESC LIMIT 2
     `).all(`%${fileName}%`);
 
-    if (fileErrors.length > 0) {
-      const errorData = JSON.parse(fileErrors[0].data);
-      const kbResult = await searchErrorKB(errorData.error);
-      if (kbResult) {
-        parts.push(`⚠️ 이 파일 관련 과거 에러 이력: ${kbResult.error_normalized}`);
-        try {
-          const res = JSON.parse(kbResult.resolution);
-          parts.push(`   해결 방법: ${res.resolvedBy || ''} (${res.tool || ''})`);
-          if (res.toolSequence) parts.push(`   해결 경로: ${res.toolSequence.join(' → ')}`);
-        } catch { parts.push(`   해결 방법: ${kbResult.resolution}`); }
-      }
+    for (const kb of kbResults) {
+      parts.push(`⚠️ 이 파일 관련 과거 에러: ${kb.error_normalized}`);
+      try {
+        const res = JSON.parse(kb.resolution);
+        parts.push(`   해결 방법: ${res.resolvedBy || ''} (${res.tool || ''})`);
+        if (res.toolSequence) parts.push(`   해결 경로: ${res.toolSequence.join(' → ')}`);
+      } catch { parts.push(`   해결 방법: ${kb.resolution}`); }
     }
   }
 
-  // 2. Bash 도구: 이전에 실패한 커맨드 경고
+  // 2. Bash 도구: 이전에 실패한 커맨드 경고 (텍스트 매칭, 벡터 검색 불필요)
   if (input.tool_name === 'Bash' && input.tool_input?.command) {
-    const cmdErrors = queryEvents({
-      type: 'tool_error',
-      sessionId: input.session_id
-    }).filter(e => e.tool === 'Bash');
+    const db = getDb();
+    const recentBashErrors = db.prepare(`
+      SELECT json_extract(data, '$.error') AS error FROM events
+      WHERE type = 'tool_error' AND session_id = ? AND json_extract(data, '$.tool') = 'Bash'
+      ORDER BY ts DESC LIMIT 1
+    `).get(input.session_id);
 
-    if (cmdErrors.length > 0) {
-      const kbResult = await searchErrorKB(cmdErrors[cmdErrors.length - 1].error);
+    if (recentBashErrors?.error) {
+      const kbResult = db.prepare(`
+        SELECT error_normalized, resolution FROM error_kb
+        WHERE error_normalized = ? AND resolution IS NOT NULL
+        LIMIT 1
+      `).get(recentBashErrors.error);
+
       if (kbResult) {
         parts.push(`💡 이 세션에서 Bash 에러 발생 이력: ${kbResult.error_normalized}`);
-        const resolution = typeof kbResult.resolution === 'string'
-          ? JSON.parse(kbResult.resolution) : kbResult.resolution;
-        if (resolution?.toolSequence) {
-          parts.push(`   이전 해결 경로: ${resolution.toolSequence.join(' → ')}`);
-        }
+        try {
+          const resolution = JSON.parse(kbResult.resolution);
+          if (resolution?.toolSequence) {
+            parts.push(`   이전 해결 경로: ${resolution.toolSequence.join(' → ')}`);
+          }
+        } catch {}
       }
     }
   }
@@ -2588,7 +2706,7 @@ try {
 ```javascript
 // ~/.self-generation/hooks/subagent-context.mjs
 import { searchErrorKB } from '../lib/error-kb.mjs';
-import { queryEvents, getProjectName, readStdin, isEnabled } from '../lib/db.mjs';
+import { queryEvents, getProjectName, getProjectPath, readStdin, isEnabled } from '../lib/db.mjs';
 import { getCachedAnalysis } from '../lib/ai-analyzer.mjs';
 
 const CODE_AGENTS = ['executor', 'executor-low', 'executor-high', 'architect', 'architect-medium',
@@ -2605,10 +2723,11 @@ try {
   }
 
   const parts = [];
-  const project = getProjectName(input.cwd);
+  const projectDir = getProjectPath(input.cwd);
+  const project = getProjectName(projectDir);
 
   // 1. 프로젝트별 최근 에러 패턴 주입 (SQL 인덱스 기반 조회)
-  const projectErrors = queryEvents({ type: 'tool_error', projectPath: input.cwd, limit: 3 });
+  const projectErrors = queryEvents({ type: 'tool_error', projectPath: projectDir, limit: 3 });
 
   if (projectErrors.length > 0) {
     parts.push('이 프로젝트의 최근 에러 패턴:');
@@ -2659,7 +2778,7 @@ try {
         "hooks": [
           {
             "type": "command",
-            "command": "node ~/.self-generation/hooks/pre-tool-guide.mjs"
+            "command": "node $HOME/.self-generation/hooks/pre-tool-guide.mjs"
           }
         ]
       }
@@ -2669,7 +2788,7 @@ try {
         "hooks": [
           {
             "type": "command",
-            "command": "node ~/.self-generation/hooks/subagent-context.mjs"
+            "command": "node $HOME/.self-generation/hooks/subagent-context.mjs"
           }
         ]
       }
@@ -2680,6 +2799,98 @@ try {
           {
             "type": "command",
             "command": "node $HOME/.self-generation/hooks/subagent-tracker.mjs"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+#### 통합 settings.json (Phase 1~5 전체)
+
+아래는 모든 Phase의 훅을 포함한 최종 `~/.claude/settings.json` 예시다. 구현 시 이 통합 버전을 사용하라.
+
+```json
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node $HOME/.self-generation/hooks/prompt-logger.mjs"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node $HOME/.self-generation/hooks/tool-logger.mjs"
+          }
+        ]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node $HOME/.self-generation/hooks/error-logger.mjs"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write|Bash|Task",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node $HOME/.self-generation/hooks/pre-tool-guide.mjs"
+          }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node $HOME/.self-generation/hooks/subagent-context.mjs"
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node $HOME/.self-generation/hooks/subagent-tracker.mjs"
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node $HOME/.self-generation/hooks/session-summary.mjs"
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node $HOME/.self-generation/hooks/session-analyzer.mjs"
           }
         ]
       }

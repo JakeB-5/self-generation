@@ -42,12 +42,15 @@ Self-Generation is a **prompt pattern analysis and auto-improvement system** for
 │   ├── subagent-tracker.mjs       # SubagentStop: performance tracking
 │   ├── session-summary.mjs        # SessionEnd: summary + AI analysis trigger + batch embedding
 │   └── session-analyzer.mjs       # SessionStart: cache injection + context
-├── lib/                           # 5 utility modules
+├── lib/                           # 8 utility modules
 │   ├── db.mjs                     # SQLite DB connection, CRUD, vector search utilities
 │   ├── ai-analyzer.mjs            # claude --print wrapper + cache management
 │   ├── error-kb.mjs               # Error KB vector search/record
 │   ├── skill-matcher.mjs          # Prompt-to-skill vector matching
-│   └── feedback-tracker.mjs       # Feedback tracking
+│   ├── feedback-tracker.mjs       # Feedback tracking
+│   ├── embedding-server.mjs       # Embedding daemon (Transformers.js model)
+│   ├── embedding-client.mjs       # Embedding daemon client (Unix socket)
+│   └── batch-embeddings.mjs       # Detached batch embedding processor
 ├── prompts/
 │   └── analyze.md                 # AI analysis prompt template
 └── bin/                           # 3 CLI tools
