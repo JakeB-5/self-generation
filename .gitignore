@@ -29,3 +29,6 @@ REFERENCE-HOOK-SYSTEM.md
 # Test temp directories
 test-home-*/
 test-tmp-*/
+
+# Test guide (local only)
+TEST-GUIDE.md
