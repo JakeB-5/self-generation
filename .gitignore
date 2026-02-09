@@ -25,3 +25,7 @@ build/
 # Logs
 *.log
 REFERENCE-HOOK-SYSTEM.md
+
+# Test temp directories
+test-home-*/
+test-tmp-*/
