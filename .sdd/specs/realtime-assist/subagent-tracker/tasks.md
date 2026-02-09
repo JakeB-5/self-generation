@@ -16,17 +16,17 @@ completed: 0
 
 ## 작업 목록
 
-### Phase 1: 스캐폴드 및 이벤트 기록
+### Phase 1: 스캐폴드 및 이벤트 기록 (v9: 간소화)
 
-- [ ] [P1] `hooks/subagent-tracker.mjs` 파일 생성 — import, try-catch 구조, readStdin()
-- [ ] [P1] SubagentStopEntry를 `events` 테이블에 insertEvent() — v, type, ts, sessionId, project, projectPath, agentId, agentType
-- [ ] [P2] [->T] 이벤트 기록 단위 테스트 — 정상 입력, 필드 누락, 비정상 JSON
+- [ ] [P1] `hooks/subagent-tracker.mjs` 파일 생성 — import, try-catch 구조, readStdin(), isEnabled()
+- [ ] [P1] SubagentStopEntry를 `events` 테이블에 insertEvent() — v=1, type='subagent_stop', ts, sessionId, project, projectPath, data={agentId, agentType} (success 필드 제거)
+- [ ] [P2] [->T] 이벤트 기록 단위 테스트 — 정상 입력, 필드 누락, 비정상 JSON, isEnabled() 비활성화 시 스킵
 
-### Phase 2: 성능 통계 집계
+### Phase 2: 성능 통계 집계 (v9: success 필드 제거)
 
-- [ ] [P1] SubagentStatsEntry를 `events` 테이블에 `subagent_stop` 타입으로 insertEvent() — v, ts, agentType, success, sessionId, project
-- [ ] [P1] 성공/실패 판정 로직 구현 — stdin 데이터의 에러 필드 유무 기반
-- [ ] [P2] [->T] 통계 기록 단위 테스트 — 성공/실패 기록, 파일 자동 생성
+- [ ] [P1] `isEnabled()` 체크 로직 추가 — config.enabled === false 시 즉시 exit 0
+- [ ] [P2] [->T] 통계 기록 단위 테스트 — subagent_stop 타입 기록, 파일 자동 생성
+- [ ] [P3] v9 변경사항 노트 작성 — "success 필드는 SubagentStop API 한계로 제거됨. 향후 agent_transcript_path 파싱으로 정확한 판정 구현 예정"
 
 ### Phase 3: 마무리
 

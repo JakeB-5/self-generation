@@ -18,7 +18,7 @@ completed: 0
 
 ### Phase 1: 기본값 상수 정의
 
-- [ ] [P1] `lib/db.mjs` 상단에 config 관련 기본값 상수 11개 정의 (`RETENTION_DAYS`, `ANALYSIS_DAYS`, `ANALYSIS_CACHE_MAX_AGE_HOURS`, `DEFAULT_DB_PATH`, `DEFAULT_EMBEDDING_MODEL`, `DEFAULT_EMBEDDING_DIMENSIONS`, `DEFAULT_EMBEDDING_THRESHOLD`, `DEFAULT_BATCH_SIZE`, `DEFAULT_SOCKET_PATH`, `DEFAULT_IDLE_TIMEOUT_MINUTES`, `DEFAULT_CLIENT_TIMEOUT_MS`)
+- [ ] [P1] `lib/db.mjs` 상단에 config 관련 기본값 상수 정의. NOTE: DESIGN.md에서 db.mjs에 정의된 상수는 4개(`GLOBAL_DIR`, `DATA_DIR`, `DB_PATH`, `RETENTION_DAYS`)뿐. 나머지 설정값은 `config.json` 스키마의 기본값으로만 존재하며, `loadConfig()`를 통해 런타임에 접근
 - [ ] [P1] `GLOBAL_DIR` 경로 상수 확인 및 config.json 경로 구성 검증
 
 ### Phase 2: loadConfig/isEnabled 구현

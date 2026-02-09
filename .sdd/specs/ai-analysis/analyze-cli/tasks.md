@@ -18,7 +18,7 @@ domain: ai-analysis
 ### Phase 1: 기반 구축
 
 - [ ] [P1] `bin/analyze.mjs` 엔트리포인트 파일 생성
-- [ ] [P1] `process.argv` 기반 인자 파싱 (`--days`, `--project`) 구현
+- [ ] [P1] `process.argv` 기반 인자 파싱 (`--days`, `--project`, `--project-path`) 구현, 기본값: `days = 30` (CLI 기본), `project = null`, `projectPath = null`. 참고: `runAnalysis()` 내부 기본값은 `days = 7`이지만, CLI에서는 `30`이 기본
 
 ### Phase 2: 핵심 구현
 

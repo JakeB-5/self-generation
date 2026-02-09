@@ -71,6 +71,7 @@ node ~/.self-generation/bin/install.mjs --uninstall --purge
 생성 대상 디렉토리:
 - `~/.self-generation/data/`
 - `~/.self-generation/hooks/`
+- `~/.self-generation/hooks/auto/`
 - `~/.self-generation/lib/`
 - `~/.self-generation/bin/`
 - `~/.self-generation/prompts/`
@@ -79,7 +80,7 @@ node ~/.self-generation/bin/install.mjs --uninstall --purge
 
 - **GIVEN** `~/.self-generation/` 디렉토리가 존재하지 않는 상태
 - **WHEN** `node install.mjs`를 실행하면
-- **THEN** `data`, `hooks`, `lib`, `bin`, `prompts` 5개 하위 디렉토리가 `mkdirSync({ recursive: true })`로 생성된다(SHALL)
+- **THEN** `data`, `hooks`, `hooks/auto`, `lib`, `bin`, `prompts` 6개 하위 디렉토리가 `mkdirSync({ recursive: true })`로 생성된다(SHALL)
 
 #### Scenario: 기존 디렉토리 존재 시 멱등성
 
@@ -279,7 +280,7 @@ node ~/.self-generation/bin/install.mjs --uninstall --purge
 
 - **GIVEN** `settings.json`에 self-generation 훅이 등록되고 `~/.self-generation/` 디렉토리에 데이터가 존재하는 상태
 - **WHEN** `node install.mjs --uninstall --purge`를 실행하면
-- **THEN** REQ-INF-006의 훅 해제를 수행한 후, `~/.self-generation/` 디렉토리 전체를 `rmSync({ recursive: true, force: true })`로 삭제한다(MAY)
+- **THEN** REQ-INF-006의 훅 해제를 수행한 후, `~/.self-generation/` 디렉토리 전체를 `rmSync({ recursive: true, force: true })`로 삭제한다(MAY). 임베딩 데몬 소켓 파일(`/tmp/self-gen-embed.sock`)이 존재하면 `unlinkSync()`로 삭제한다(MAY)
 
 #### Scenario: purge 단독 사용 불가
 

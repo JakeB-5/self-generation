@@ -39,7 +39,7 @@ CREATE TABLE error_kb (
 );
 
 -- UNIQUE index on error_normalized (supports UPSERT ON CONFLICT)
-CREATE UNIQUE INDEX IF NOT EXISTS idx_error_kb_normalized ON error_kb(error_normalized);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_error_kb_error ON error_kb(error_normalized);
 
 -- Vector search virtual table (sqlite-vec)
 CREATE VIRTUAL TABLE vec_error_kb USING vec0(
@@ -105,13 +105,15 @@ QMD의 Strong-signal shortcut 패턴을 차용한 3단계 검색 전략 (우선�
    (`?`에는 `normalizedError.slice(0, 30) + '%'` 바인딩)
    - 길이 비율 검증: `min(queryLen, resultLen) / max(queryLen, resultLen) >= 0.7` (SHALL)
    - 길이 비율 미달 시 벡터 검색으로 폴스루 (SHALL)
-3. **벡터 유사도 검색 (fallback)**: 텍스트 매칭 실패 시에만 실행 (~5ms via daemon) (SHALL). `generateEmbeddings()`로 쿼리 임베딩을 생성하고, `vec_error_kb` 가상 테이블에서 cosine distance < 0.76 조건으로 상위 3건을 검색한다. `resolution`이 있는 항목만 필터링한다.
+3. **벡터 유사도 검색 (fallback)**: 텍스트 매칭 실패 시에만 실행 (~5ms via daemon) (SHALL). `generateEmbeddings()`로 쿼리 임베딩을 생성하고, `vec_error_kb` 가상 테이블에서 상위 3건을 검색한다. `resolution`이 있는 항목만 필터링한다.
    ```javascript
    const embeddings = await generateEmbeddings([normalizedError]);
    const vectorResults = vectorSearch('error_kb', 'vec_error_kb', embeddings[0], 3)
      .filter(r => r.resolution != null);
-   // distance < 0.76이면 매치
    ```
+   - **고신뢰 매칭** (distance < 0.76): 즉시 해당 엔트리를 반환한다(SHALL)
+   - **저신뢰 매칭** (0.76 ≤ distance < 0.85): 키워드 검증을 추가로 수행해야 한다(SHALL). 쿼리와 매치 결과의 error_normalized에서 주요 키워드(3자 이상 단어)를 추출하고, 최소 1개 이상 공통 키워드가 있을 때만 유효한 매치로 판정한다
+   - **매칭 없음** (distance ≥ 0.85): `null`을 반환한다(SHALL)
 
 검색 결과 처리:
 - 매치가 발견되면 해당 엔트리의 `use_count`를 1 증가시키고 `last_used`를 현재 시각으로 갱신해야 한다(SHALL).
@@ -140,11 +142,23 @@ QMD의 Strong-signal shortcut 패턴을 차용한 3단계 검색 전략 (우선�
 - **WHEN** `searchErrorKB(normalizedError)`를 호출하면
 - **THEN** 접두사 매치를 무시하고, 벡터 유사도 검색으로 해당 엔트리를 반환한다
 
-#### Scenario RA-002-4: 텍스트 매치 실패 후 벡터 검색 Fallback
+#### Scenario RA-002-4: 텍스트 매치 실패 후 벡터 검색 Fallback (고신뢰)
 
 - **GIVEN** `error_kb`에 텍스트 정확/접두사 매치가 없지만, 임베딩이 있는 의미적 유사 엔트리(cosine distance 0.15)가 존재
 - **WHEN** `searchErrorKB(normalizedError)`를 호출하면
 - **THEN** 벡터 유사도 검색으로 해당 엔트리를 반환한다
+
+#### Scenario RA-002-4b: 저신뢰 벡터 매칭 + 키워드 검증 통과
+
+- **GIVEN** `error_kb`에 텍스트 매치가 없고, 벡터 검색 결과 distance 0.80(저신뢰 구간)인 엔트리가 있으며, 쿼리와 매치 결과 간 공통 키워드("module", "not", "found")가 1개 이상 존재
+- **WHEN** `searchErrorKB(normalizedError)`를 호출하면
+- **THEN** 키워드 검증을 통과하여 해당 엔트리를 반환한다
+
+#### Scenario RA-002-4c: 저신뢰 벡터 매칭 + 키워드 검증 실패
+
+- **GIVEN** `error_kb`에 텍스트 매치가 없고, 벡터 검색 결과 distance 0.82(저신뢰 구간)인 엔트리가 있지만, 쿼리와 매치 결과 간 공통 키워드가 0개
+- **WHEN** `searchErrorKB(normalizedError)`를 호출하면
+- **THEN** 키워드 검증 실패로 `null`을 반환한다
 
 #### Scenario RA-002-5: DB 부재 시
 

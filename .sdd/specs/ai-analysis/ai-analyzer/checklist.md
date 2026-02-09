@@ -1,51 +1,54 @@
-# ai-analyzer 검증 체크리스트
+# 체크리스트: ai-analyzer
 
-## REQ-AA-001: Content-Addressable 입력 해시
+## 스펙 완성도
+- [x] 모든 REQ(AA-001~007)에 GIVEN-WHEN-THEN 시나리오 포함
+- [x] RFC 2119 키워드 적절히 사용 (SHALL 중심, SHOULD 일부 성능 목표)
+- [x] depends 필드 정확 (log-writer, feedback-tracker, skill-matcher)
 
-- [ ] `computeInputHash(events)` 함수로 SHA-256 해시 계산
-- [ ] 해시 입력: `type:ts:session_id:data` 조합
-- [ ] 동일 이벤트 배열 → 동일 해시
-- [ ] 이벤트 변경 → 해시 변경
+## DESIGN.md 일치
+- [x] REQ-AA-001: Content-Addressable 입력 해시 (SHA-256, type+ts+session_id+data) — DESIGN.md 5.2절 computeInputHash 일치
+- [x] REQ-AA-002: 동기 AI 분석 실행 (claude --print --model sonnet, 캐시 히트 확인, UPSERT, 프롬프트 5개 미만 스킵) — DESIGN.md 5.1절 runAnalysis 일치
+- [x] REQ-AA-003: 비동기 AI 분석 실행 (spawn detached + unref) — DESIGN.md 5.1절 runAnalysisAsync 일치
+- [x] REQ-AA-004: 프롬프트 빌드 (analyze.md 템플릿, 로그/피드백/스킬/메트릭 주입, loadSkills 인자 없이 호출) — DESIGN.md 5.1절 buildPrompt 일치
+- [x] REQ-AA-005: JSON 응답 추출 (코드 블록 + 순수 JSON 지원) — DESIGN.md 5.2절 extractJSON 일치
+- [x] REQ-AA-006: 분석 캐시 조회 (TTL 24시간, 프로젝트 필터, null 폴백) — DESIGN.md 5.2절 getCachedAnalysis 일치
+- [x] REQ-AA-007: 로그 요약 (프롬프트 최근 100개, 세션별 도구 시퀀스 집계) — DESIGN.md 5.2절 summarizeForPrompt 일치
 
-## REQ-AA-002: 동기 AI 분석 실행
+## 교차 참조
+- [x] db.mjs queryEvents로 이벤트 조회
+- [x] db.mjs getDb로 analysis_cache 테이블 접근
+- [x] feedback-tracker.mjs getFeedbackSummary로 피드백 이력 조회
+- [x] skill-matcher.mjs loadSkills로 전역 스킬 조회 (인자 없이 호출)
+- [x] session-summary에서 runAnalysisAsync 호출
+- [x] session-start-hook에서 getCachedAnalysis 호출
+- [x] analyze-cli에서 runAnalysis 호출
 
-- [ ] `runAnalysis(options = {})` 동기 실행
-- [ ] 프롬프트 5개 미만 시 분석 생략
-- [ ] Content-Addressable 캐시 히트 확인
-- [ ] `claude --print --model sonnet` 실행
-- [ ] clusters/workflows/errorPatterns/suggestions/skill_descriptions 포함
-- [ ] `analysis_cache` 테이블에 `input_hash` 함께 저장
-- [ ] UPSERT로 기존 캐시 갱신 (행 ID 보존)
-- [ ] `claude --print` 실패 시 예외 전파 안함
+## 테스트 계획
+- [x] computeInputHash 동일 이벤트 일관성
+- [x] computeInputHash 이벤트 변경 시 해시 변경
+- [x] runAnalysis 충분한 데이터로 분석 실행 (claude --print)
+- [x] runAnalysis Content-Addressable 캐시 히트
+- [x] runAnalysis 데이터 부족 시 분석 생략 (프롬프트 5개 미만)
+- [x] runAnalysis claude --print 실행 실패 시 빈 결과 + 에러 메시지 반환
+- [x] runAnalysis 캐시 저장 시 UPSERT (INSERT ON CONFLICT DO UPDATE)
+- [x] runAnalysisAsync detached 프로세스 생성 (spawn + unref)
+- [x] buildPrompt 모든 데이터 존재 시 플레이스홀더 치환
+- [x] buildPrompt 피드백 이력 없는 첫 분석
+- [x] extractJSON 코드 블록 내 JSON 추출
+- [x] extractJSON 순수 JSON 응답 추출
+- [x] getCachedAnalysis 유효한 캐시 조회 (프로젝트 필터)
+- [x] getCachedAnalysis 다른 프로젝트 캐시 미반환
+- [x] getCachedAnalysis 캐시 만료 시 null 반환
+- [x] getCachedAnalysis DB 오류 시 null 반환
+- [x] summarizeForPrompt 대량 로그 요약 (프롬프트 최근 100개)
+- [x] summarizeForPrompt 반환 객체 구조 (prompts, toolSequences, errors, sessionSummaries)
 
-## REQ-AA-003: 비동기 AI 분석 실행
-
-- [ ] `runAnalysisAsync(options)` detached 프로세스로 실행
-- [ ] 부모 프로세스 블로킹 방지
-
-## REQ-AA-004: 프롬프트 구성
-
-- [ ] `prompts/analyze.md` 템플릿 로드
-- [ ] 실제 로그 데이터 주입
-- [ ] 피드백 이력 주입 (feedback-tracker)
-- [ ] 기존 글로벌 스킬 주입 (skill-matcher)
-- [ ] 결과 메트릭 주입
-
-## REQ-AA-005: 응답 파싱
-
-- [ ] 코드 펜스 (```json) 응답 처리
-- [ ] Raw JSON 응답 처리
-- [ ] `JSON.parse()` 실패 시 처리
-
-## REQ-AA-006: 캐시 조회 및 TTL
-
-- [ ] TTL 기반 캐시 만료 확인 (기본 24시간)
-- [ ] 프로젝트 필터링으로 크로스 프로젝트 오염 방지
-- [ ] 실패 시 null 반환
-
-## REQ-AA-007: 로그 요약
-
-- [ ] 최근 100개 프롬프트로 제한
-- [ ] 도구 시퀀스 집계 (예: Grep→Read→Edit)
-- [ ] 에러 압축
-- [ ] 성능: 10K 레코드 500ms 이내
+## 구현 주의사항
+- **computeInputHash 컨텐츠 수준**: type+ts+session_id+data로 SHA-256, 동일 이벤트 → 동일 해시
+- **UPSERT 패턴**: INSERT ON CONFLICT(project, days, input_hash) DO UPDATE SET ts, analysis
+- **claude --print 옵션**: input, encoding: 'utf-8', maxBuffer: 10MB, timeout: 120000ms
+- **loadSkills 인자 없이**: buildPrompt 내에서 loadSkills() 호출 → 전역 스킬만 로드
+- **getCachedAnalysis project null**: project=null이면 'all' 키로 조회 (프로젝트별 캐시 오염 방지)
+- **summarizeForPrompt 세션별 집계**: 도구 사용을 세션별로 '도구→도구' 시퀀스 문자열로 요약
+- **AI 분석 스키마**: clusters, workflows, errorPatterns, suggestions, skill_descriptions
+- **안정성 보장**: AI 분석 실패 시 빈 결과 반환, 예외 전파 금지

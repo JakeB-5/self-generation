@@ -62,6 +62,12 @@ function computeInputHash(events) {
 - **WHEN** `runAnalysis({ days: 7, project: 'my-app' })`을 호출한다
 - **THEN** `claude --print`가 실행되지 않고, `analysis_cache` 테이블에서 캐시된 결과가 반환된다
 
+#### Scenario: NULL input_hash 레코드는 캐시 히트에서 제외
+
+- **GIVEN** `analysis_cache` 테이블에 `input_hash`가 `NULL`인 레코드(이전 버전 호환)가 존재한다
+- **WHEN** `runAnalysis({ days: 7, project: 'my-app' })`을 호출한다
+- **THEN** `input_hash IS NOT NULL` 조건으로 캐시 조회하여 NULL 레코드는 무시하고, 새 분석을 실행하며 non-NULL hash를 생성한다
+
 #### Scenario: 데이터 부족 시 분석 생략
 
 - **GIVEN** `events` 테이블에 최근 7일간 프롬프트가 3개만 기록되어 있다
@@ -118,13 +124,21 @@ DO UPDATE SET ts = excluded.ts, analysis = excluded.analysis
 
 ### REQ-AA-004: 프롬프트 빌드 (buildPrompt)
 
-시스템은 `prompts/analyze.md` 템플릿 파일을 로드하고, 로그 데이터/피드백 이력/기존 스킬 목록/제안 효과 메트릭을 주입하여 완성된 프롬프트를 생성해야 한다(SHALL). 피드백 데이터는 `feedback` 테이블에서 `getFeedbackSummary()`를 통해 조회한다. 기존 스킬은 `loadSkills()`를 인자 없이 호출하여 전역 스킬(`~/.claude/commands/`)만 로드한다.
+시스템은 `prompts/analyze.md` 템플릿 파일을 로드하고, 로그 데이터/피드백 이력/기존 스킬 목록/제안 효과 메트릭을 주입하여 완성된 프롬프트를 생성해야 한다(SHALL). 피드백 데이터는 `feedback` 테이블에서 `getFeedbackSummary()`를 통해 조회한다. 기존 스킬은 `loadSkills(resolvedPath)`를 호출하여 전역 스킬(`~/.claude/commands/`) 및 프로젝트별 스킬(`.claude/commands/`)을 모두 로드한다.
+
+`resolvedPath`는 다음 로직으로 결정한다:
+- `projectPath`가 존재하면 그대로 사용
+- `projectPath`가 없고 `project`가 존재하면 `queryEvents({project, limit:1})[0]?.projectPath`로 대체 해소
 
 #### Scenario: 모든 데이터가 존재할 때 프롬프트 빌드
 
 - **GIVEN** `prompts/analyze.md` 템플릿이 존재하고, `feedback` 테이블에 피드백 이력이 있고 기존 스킬이 등록되어 있다
 - **WHEN** `buildPrompt(logSummary, 7, 'my-app', '/path/to/my-app')`을 호출한다
 - **THEN** 템플릿의 `{{days}}`, `{{project}}`, `{{log_data}}`, `{{feedback_history}}`, `{{existing_skills}}`, `{{outcome_metrics}}` 플레이스홀더가 모두 실제 데이터로 치환된 문자열이 반환된다
+- **AND** `{{outcome_metrics}}`는 다음 필드를 포함한다:
+  - `skillUsageRate`: `calcSkillUsageRate()` 결과 (스킬 사용률 통계)
+  - `ruleEffectiveness`: `calcRuleEffectiveness()` 결과 (규칙 효과성 평가)
+  - `staleSkills`: `findStaleSkills(30, resolvedPath)` 결과 (30일 미사용 스킬 목록)
 
 #### Scenario: 피드백 이력이 없는 첫 분석
 
@@ -132,7 +146,11 @@ DO UPDATE SET ts = excluded.ts, analysis = excluded.analysis
 - **WHEN** `buildPrompt(logSummary, 7, null, null)`을 호출한다
 - **THEN** `{{feedback_history}}`는 `'피드백 이력 없음 (첫 분석)'`으로, `{{existing_skills}}`는 `'등록된 스킬 없음'`으로, `{{project}}`는 `'all'`로 치환된다
 
-**비고**: `buildPrompt` 내에서 `loadSkills()`를 인자 없이 호출하므로 전역 스킬(`~/.claude/commands/`)만 로드됨. 프로젝트별 스킬은 포함되지 않음.
+#### Scenario: projectPath 없이 project만 제공된 경우
+
+- **GIVEN** `projectPath`는 `null`이지만 `project`는 `'my-app'`이다
+- **WHEN** `buildPrompt(logSummary, 7, 'my-app', null)`을 호출한다
+- **THEN** `queryEvents({project: 'my-app', limit:1})[0]?.projectPath`를 조회하여 `resolvedPath`를 대체 해소하고, `loadSkills(resolvedPath)`로 전역+프로젝트 스킬을 로드한다
 
 ---
 
@@ -218,7 +236,8 @@ ORDER BY ts DESC LIMIT 1
     prompts: [{ ts, text, project }],       // type === 'prompt', 최근 100개
     toolSequences: string[],                // 세션별 '도구→도구' 시퀀스 문자열
     errors: [{ tool, error, raw }],         // type === 'tool_error'
-    sessionSummaries: [...]                 // type === 'session_summary'
+    sessionCount: number,                   // type === 'session_summary' 개수
+    toolTotal: number                       // 전체 도구 사용 횟수
   }
   ```
 

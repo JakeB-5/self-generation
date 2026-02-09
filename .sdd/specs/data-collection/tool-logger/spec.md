@@ -48,6 +48,22 @@ constitution_version: "2.0.0"
 - **WHEN** `extractToolMeta('Read', { file_path: '/src/index.ts' })`가 호출되면
 - **THEN** `{ file: '/src/index.ts' }`가 반환(SHALL)된다
 
+### Scenario: 민감 파일 경로 마스킹
+
+- **GIVEN** 파일 경로가 민감 패턴(`.env`, `.env.*`, `credentials.json`, `*.key`, `*.pem`, `id_rsa*`)에 매칭되는 상태
+- **WHEN** `extractToolMeta('Read', { file_path: '/app/.env' })`가 호출되면
+- **THEN** `{ file: '[SENSITIVE_PATH]' }`로 마스킹되어 반환(SHALL)된다
+
+### Scenario: 민감 파일 패턴 목록
+
+시스템은 다음 패턴을 민감 파일로 판단(SHALL)해야 한다:
+- `.env` (정확한 파일명 또는 경로 구성 요소)
+- `.env.*` (`.env.local`, `.env.production` 등)
+- `credentials.json`
+- `*.key` (예: `private.key`, `api.key`)
+- `*.pem` (예: `cert.pem`, `key.pem`)
+- `id_rsa*` (예: `id_rsa`, `id_rsa.pub`)
+
 ### Scenario: Task 도구 — 에이전트 정보 저장
 
 - **GIVEN** Task 도구가 서브에이전트를 생성한 상태

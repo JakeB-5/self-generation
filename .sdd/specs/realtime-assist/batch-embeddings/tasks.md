@@ -32,16 +32,17 @@ completed: 0
 - [ ] [P2] 미임베딩 에러 KB 조회 (`WHERE id NOT IN (SELECT error_kb_id FROM vec_error_kb)`)
 - [ ] [P2] `generateEmbeddings(texts)` 호출 및 `Float32Array` → `Buffer` 변환 후 `vec_error_kb`에 DELETE + INSERT
 
-### Phase 4: 스킬 임베딩 갱신
+### Phase 4: 스킬 임베딩 갱신 (v9: 500자 절단)
 
 - [ ] [P2] `loadSkills(projectPath)` 호출 및 스킬 목록 순회
+- [ ] [P2] 스킬 content 500자 절단 처리 — `skill.content.slice(0, 500)` 명시 적용
 - [ ] [P2] `skill_embeddings` 테이블 UPSERT — `INSERT OR REPLACE` + `extractPatterns()` → `keywords` JSON
 - [ ] [P2] `skillId` 획득 (lastInsertRowid 폴백) 및 `vec_skill_embeddings`에 DELETE + INSERT
 
-### Phase 5: 테스트
+### Phase 5: 테스트 (v9: 500자 절단 검증)
 
-- [ ] [P3] [->T] 단위 테스트 — 미임베딩 조회, Buffer 변환, skillId 획득 로직
-- [ ] [P3] [->T] 통합 테스트 — 전체 배치 플로우 (에러 KB + 스킬), 데몬 미실행 시 graceful 종료, exit 0 보장
+- [ ] [P3] [->T] 단위 테스트 — 미임베딩 조회, Buffer 변환, skillId 획득 로직, 스킬 500자 절단
+- [ ] [P3] [->T] 통합 테스트 — 전체 배치 플로우 (에러 KB + 스킬), 데몬 미실행 시 graceful 종료, exit 0 보장, 스킬 content 절단 동작
 
 ---
 

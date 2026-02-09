@@ -8,7 +8,8 @@ domains:
       - config-schema
   data-collection:
     description: "Phase 1: 데이터 수집 레이어"
-    depends_on: []
+    depends_on:
+      - infra
     specs:
       - log-writer
       - prompt-logger
