@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Self-Generation is a **prompt pattern analysis and auto-improvement system** for Claude Code. It collects user prompts, tool usage, and errors via Claude Code Hooks API, analyzes patterns using `claude --print` AI agent, and automatically suggests custom skills, CLAUDE.md directives, and hook workflows.
+Self-Generation is a **prompt pattern analysis and auto-improvement system** for Claude Code. It collects user prompts, tool usage, and errors via Claude Code Hooks API, analyzes patterns using Claude in headless mode, and automatically suggests custom skills, CLAUDE.md directives, and hook workflows.
 
 **Target environment**: Vanilla Claude Code (no plugins/OMC required)
 
@@ -14,7 +14,7 @@ Self-Generation is a **prompt pattern analysis and auto-improvement system** for
 
 - **Runtime**: Node.js >= 18 (tested on v22), ES Modules (`.mjs`)
 - **Storage**: SQLite (`better-sqlite3`) + `sqlite-vec` (vector extension), single DB file (`self-gen.db`), WAL mode
-- **Analysis**: `claude --print` for semantic pattern analysis (async/background only)
+- **Analysis**: Claude headless mode for semantic pattern analysis (async/background only)
 - **Embedding**: `@xenova/transformers` + `paraphrase-multilingual-MiniLM-L12-v2` (384-dim, offline)
 - **Hook system**: Claude Code Hooks API (8 events registered in `~/.claude/settings.json`)
 - **Dependencies**: `better-sqlite3`, `sqlite-vec`, `@xenova/transformers` — exactly 3 external packages (no more allowed)
@@ -28,7 +28,7 @@ nvm use 22
 # Install dependencies
 npm install
 
-# Run all tests (237 tests, 46 suites)
+# Run all tests (251 tests, 47 suites)
 npm test
 
 # Install system (registers hooks, creates directories, installs deps)
@@ -78,7 +78,7 @@ node bin/dismiss.mjs <suggestion-id>
 ├── hooks/auto/                    # Auto-generated hook workflows (created dynamically by apply.mjs)
 ├── lib/                           # 8 utility modules
 │   ├── db.mjs                     # SQLite DB connection, CRUD, vector search, config, privacy utilities
-│   ├── ai-analyzer.mjs            # claude --print wrapper + cache management
+│   ├── ai-analyzer.mjs            # Claude headless mode wrapper + cache management
 │   ├── error-kb.mjs               # Error KB: normalize, vector search (3-stage), record resolution
 │   ├── skill-matcher.mjs          # Prompt-to-skill: vector + keyword fallback matching
 │   ├── feedback-tracker.mjs       # Feedback recording, usage rates, stale skill detection
@@ -102,7 +102,7 @@ node bin/dismiss.mjs <suggestion-id>
 - **Privacy-conscious**: Bash commands store first word only; `<private>` tags stripped; error messages normalized (paths→`<PATH>`, numbers→`<N>`, strings→`<STR>`)
 - **Vector search**: sqlite-vec extension for error KB and skill matching with 384-dim cosine similarity
 - **WAL mode**: Write-Ahead Logging for concurrent hook DB access
-- **No sync AI in hooks**: `claude --print` is NEVER called synchronously in hooks; batch analysis uses detached `spawn` only
+- **No sync AI in hooks**: Claude headless mode is NEVER invoked synchronously in hooks; batch analysis uses detached `spawn` only
 
 ### DB Schema (5 tables + 2 vec0 virtual tables + FTS5)
 
