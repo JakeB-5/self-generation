@@ -1,7 +1,7 @@
 ---
-version: 2.0.0
+version: 2.1.0
 created: 2026-02-07
-updated: 2026-02-07
+updated: 2026-02-09
 ---
 
 # Constitution: self-generation

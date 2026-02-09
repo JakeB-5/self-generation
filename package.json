@@ -1,0 +1,14 @@
+{
+  "name": "self-generation",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "dependencies": {
+    "better-sqlite3": "^11.0.0",
+    "sqlite-vec": "^0.1.0",
+    "@xenova/transformers": "^2.17.0"
+  },
+  "scripts": {
+    "test": "node --test tests/*.test.mjs"
+  }
+}
