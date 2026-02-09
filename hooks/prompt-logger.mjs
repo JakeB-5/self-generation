@@ -10,7 +10,7 @@ try {
   const config = loadConfig();
   if (config.enabled === false) process.exit(0);
 
-  // Privacy tag stripping (REQ-DC-103) + collectPromptText check (REQ-DC-102)
+  // Privacy tag stripping + collectPromptText check (REQ-DC-102)
   const rawPrompt = config.collectPromptText === false ? '[REDACTED]' : input.prompt;
   const promptText = stripPrivateTags(rawPrompt);
 
@@ -27,13 +27,13 @@ try {
   };
   insertEvent(entry);
 
-  // 2. Skill auto-detection (REQ-DC-104)
+  // 2. Skill auto-detection (REQ-DC-106)
   const projectPath = getProjectPath(input.cwd);
   const skills = loadSkills(projectPath);
   if (skills.length > 0) {
     const matched = await Promise.race([
       matchSkill(input.prompt, skills),
-      new Promise(resolve => setTimeout(() => resolve(null), 3000))
+      new Promise(resolve => setTimeout(() => resolve(null), 2000))
     ]);
     if (matched) {
       const output = {
@@ -48,7 +48,7 @@ try {
     }
   }
 
-  // 3. Skill usage event tracking (REQ-DC-105)
+  // 3. Skill usage event tracking (REQ-DC-103)
   if (input.prompt && input.prompt.startsWith('/')) {
     const skillName = input.prompt.split(/\s+/)[0].slice(1);
     const isActualSkill = skills.some(s => s.name === skillName);
@@ -67,6 +67,6 @@ try {
 
   process.exit(0);
 } catch (e) {
-  // REQ-DC-106: Non-blocking (exit 0 on any error)
+  // REQ-DC-104: Non-blocking (exit 0 on any error)
   process.exit(0);
 }

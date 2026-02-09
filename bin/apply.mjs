@@ -99,7 +99,7 @@ function applySkill(suggestion) {
 function applyClaudeMd(suggestion) {
   const claudeMdPath = isGlobal
     ? join(process.env.HOME, '.claude', 'CLAUDE.md')
-    : join(process.cwd(), 'CLAUDE.md');
+    : join(process.cwd(), '.claude', 'CLAUDE.md');
   const claudeDir = join(claudeMdPath, '..');
   if (!existsSync(claudeDir)) mkdirSync(claudeDir, { recursive: true });
   const rule = suggestion.rule || suggestion.summary;

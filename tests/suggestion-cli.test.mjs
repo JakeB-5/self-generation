@@ -248,7 +248,7 @@ describe('Suggestion CLI Tests', () => {
     assert.match(result, /CLAUDE\.md 업데이트:/);
 
     // Verify file updated
-    const claudeFile = join(projectDir, 'CLAUDE.md');
+    const claudeFile = join(projectDir, '.claude', 'CLAUDE.md');
     assert.ok(existsSync(claudeFile));
     const content = readFileSync(claudeFile, 'utf-8');
     assert.match(content, /## 자동 감지된 규칙/);

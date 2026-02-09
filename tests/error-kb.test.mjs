@@ -114,7 +114,7 @@ describe('error-kb', () => {
       assert.ok(result.resolution);
       const resolution = JSON.parse(result.resolution);
       assert.equal(resolution.resolved_by, 'Bash');
-      assert.equal(result.use_count, 1); // 0 from insert + 1 from search
+      assert.equal(result.use_count, 2); // 1 from insert + 1 from search
     });
 
     it('should increment use_count on repeated exact matches', async () => {
@@ -125,7 +125,7 @@ describe('error-kb', () => {
       await errorKb.searchErrorKB(normalized);
       const result = await errorKb.searchErrorKB(normalized);
 
-      assert.equal(result.use_count, 3); // 0 insert + 3 searches
+      assert.equal(result.use_count, 4); // 1 insert + 3 searches
     });
   });
 
@@ -150,7 +150,7 @@ describe('error-kb', () => {
       assert.equal(row.error_raw, 'second version');
       const resolution = JSON.parse(row.resolution);
       assert.equal(resolution.resolved_by, 'ToolB');
-      assert.equal(row.use_count, 1); // 0 first insert + 1 on second insert (conflict)
+      assert.equal(row.use_count, 2); // 1 first insert + 1 on second insert (conflict)
     });
   });
 
