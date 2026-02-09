@@ -1,5 +1,5 @@
 #!/bin/sh
-# Self-Generation pre-push hook
+# Reflexion pre-push hook
 # 푸시 전 전체 검증 수행
 
 # 색상 정의

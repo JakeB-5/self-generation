@@ -1,5 +1,5 @@
 #!/bin/sh
-# Self-Generation pre-commit hook
+# Reflexion pre-commit hook
 # SDD 스펙 검증 + 코드 품질 검사
 
 # 색상 정의
